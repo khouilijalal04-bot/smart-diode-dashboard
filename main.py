@@ -614,7 +614,111 @@ body::before {
   grid-template-rows: auto 1fr;
   gap: 12px;
   padding: 12px;
-  height: calc(100vh - 58px);
+  min-height: calc(100vh - 58px);
+  width: 100%;
+  overflow-x: hidden;
+}
+/* =========================
+   RESPONSIVE MOBILE FIX
+========================= */
+
+@media (max-width: 1200px) {
+
+  .layout {
+    grid-template-columns: 1fr;
+    height: auto;
+  }
+
+  .left-panel,
+  .center-panel,
+  .right-panel {
+    grid-row: auto;
+  }
+
+  .header {
+    flex-direction: column;
+    height: auto;
+    gap: 10px;
+    padding: 12px;
+  }
+
+  .header-right {
+    width: 100%;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .chart-wrap {
+    height: 400px;
+  }
+
+  .table-wrap {
+    max-height: 300px;
+  }
+
+}
+
+@media (max-width: 768px) {
+
+  body {
+    overflow-x: hidden;
+  }
+
+  .layout {
+    padding: 8px;
+    gap: 8px;
+  }
+
+  .card {
+    padding: 12px;
+  }
+
+  .header {
+    padding: 10px;
+  }
+
+  .logo-text {
+    font-size: 11px;
+  }
+
+  .logo-sub {
+    font-size: 8px;
+  }
+
+  .header-stat-val {
+    font-size: 12px;
+  }
+
+  .live-grid,
+  .axes-grid,
+  .shockley-row,
+  .id-params {
+    grid-template-columns: 1fr;
+  }
+
+  .chart-wrap {
+    height: 300px;
+  }
+
+  canvas {
+    max-width: 100% !important;
+  }
+
+  .btn {
+    font-size: 10px;
+    padding: 10px;
+  }
+
+  table {
+    font-size: 10px;
+  }
+
+  tbody td,
+  thead th {
+    padding: 4px;
+  }
+
 }
 
 /* ── CARDS ── */
