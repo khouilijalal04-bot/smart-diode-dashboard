@@ -1,293 +1,147 @@
 from flask import Flask, request, jsonify
 import math
+from collections import deque
 
 app = Flask(__name__)
 
-# ===============================
-# DATA STORAGE
-# ===============================
-data_store = []
+# ======================
+# CONFIG
+# ======================
+MAX_POINTS = 500
+data_store = deque(maxlen=MAX_POINTS)
+
 running = False
+sampling_interval = 0.5  # default 0.5s
+
 identified_diode = None
 
-# ===============================
-# DIODE DATABASE
-# ===============================
+# ======================
+# DIODE DB (clean)
+# ======================
 DIODE_DATABASE = [
-    {
-        "id": "schottky",
-        "name": "Schottky",
-        "model": "BAT46 / 1N5817",
-        "color": "#ff9800",
-        "description": "Jonction métal-semiconducteur, très faible Vf, haute fréquence",
-        "vf_min": 0.10, "vf_max": 0.35,
-        "Is_nA": 100.0, "n": 1.1,
-        "applications": "Redressement HF, protection inverse, détecteurs RF"
-    },
-    {
-        "id": "germanium",
-        "name": "Germanium",
-        "model": "1N60 / OA91",
-        "color": "#9c27b0",
-        "description": "Technologie ancienne, Vf très bas, très sensible",
-        "vf_min": 0.15, "vf_max": 0.40,
-        "Is_nA": 500.0, "n": 1.0,
-        "applications": "Détection AM, démodulation, circuits vintage"
-    },
-    {
-        "id": "silicon_low",
-        "name": "Silicium signal",
-        "model": "1N914 / 1N4148",
-        "color": "#2196f3",
-        "description": "Diode silicium signal — polyvalente, rapide, très utilisée",
-        "vf_min": 0.40, "vf_max": 0.60,
-        "Is_nA": 10.0, "n": 1.5,
-        "applications": "Signal, logique, protection ESD, redressement"
-    },
-    {
-        "id": "silicon_std",
-        "name": "Silicium standard",
-        "model": "1N4007 / 1N4001",
-        "color": "#3fa9ff",
-        "description": "Diode silicium redresseur — robuste, standard industriel",
-        "vf_min": 0.55, "vf_max": 0.80,
-        "Is_nA": 10.0, "n": 1.8,
-        "applications": "Redressement 50Hz, alimentation, protection"
-    },
-    {
-        "id": "led_ir",
-        "name": "LED IR / Rouge",
-        "model": "λ≈660–950nm",
-        "color": "#f44336",
-        "description": "LED émettant dans le rouge ou l'infrarouge — GaAs / GaAsP",
-        "vf_min": 0.80, "vf_max": 1.40,
-        "Is_nA": 0.001, "n": 2.0,
-        "applications": "Télécommandes IR, capteurs optiques, afficheurs"
-    },
-    {
-        "id": "led_yellow",
-        "name": "LED Jaune / Orange",
-        "model": "λ≈590–620nm",
-        "color": "#ffc107",
-        "description": "LED jaune ou orange — GaAsP/GaP",
-        "vf_min": 1.40, "vf_max": 1.90,
-        "Is_nA": 0.0001, "n": 2.0,
-        "applications": "Signalisation, afficheurs, indicateurs"
-    },
-    {
-        "id": "led_green",
-        "name": "LED Verte",
-        "model": "λ≈520–565nm",
-        "color": "#4caf50",
-        "description": "LED verte — GaP ou InGaN selon la génération",
-        "vf_min": 1.80, "vf_max": 2.40,
-        "Is_nA": 0.00001, "n": 2.0,
-        "applications": "Signalisation, éclairage, rétroéclairage"
-    },
-    {
-        "id": "led_blue",
-        "name": "LED Bleue / Blanche",
-        "model": "λ≈450–470nm",
-        "color": "#00bcd4",
-        "description": "LED bleue ou blanche — InGaN/GaN, technologie moderne",
-        "vf_min": 2.40, "vf_max": 3.50,
-        "Is_nA": 0.000001, "n": 2.0,
-        "applications": "Éclairage LED, écrans, phares automobiles"
-    },
-    {
-        "id": "zener",
-        "name": "Zener",
-        "model": "BZX55 / 1N47xx",
-        "color": "#ff5722",
-        "description": "Régulation de tension — effet avalanche ou Zener",
-        "vf_min": 0.50, "vf_max": 0.75,
-        "Is_nA": 5.0, "n": 1.9,
-        "applications": "Régulation tension, référence, protection surtension"
-    }
+    {"id":"schottky","name":"Schottky","vf_min":0.1,"vf_max":0.35,"n":1.1,"Is_nA":100},
+    {"id":"germanium","name":"Germanium","vf_min":0.15,"vf_max":0.40,"n":1.0,"Is_nA":500},
+    {"id":"silicon","name":"Silicon","vf_min":0.55,"vf_max":0.80,"n":1.8,"Is_nA":10},
+    {"id":"led","name":"LED","vf_min":1.6,"vf_max":3.3,"n":2.0,"Is_nA":0.001},
 ]
 
+# ======================
+# SAFE EXP (important)
+# ======================
+def safe_exp(x):
+    if x > 40:
+        return math.exp(40)
+    return math.exp(x)
 
-# ===============================
-# IDENTIFICATION ALGORITHM
-# ===============================
-def identify_diode_from_curve(data):
-    if len(data) < 8:
+# ======================
+# SIMPLE SMOOTHING
+# ======================
+def smooth(data, window=3):
+    if len(data) < window:
+        return data
+    out = []
+    for i in range(len(data)):
+        chunk = data[max(0,i-window):i+1]
+        u = sum(p["U"] for p in chunk)/len(chunk)
+        i_ = sum(p["I"] for p in chunk)/len(chunk)
+        out.append({"U":u,"I":i_})
+    return out
+
+# ======================
+# IDENTIFICATION v2
+# ======================
+def identify(data):
+    if len(data) < 10:
         return None
 
-    u_vals = [d['U'] for d in data]
-    i_vals = [d['I'] for d in data]
-    i_max = max(i_vals)
-    if i_max <= 0:
+    data = smooth(list(data))
+
+    u = [p["U"] for p in data]
+    i = [p["I"] for p in data]
+
+    imax = max(i)
+    if imax <= 0:
         return None
 
-    # Step 1: Vf at 10% of Imax
-    vf = None
-    for i in range(len(u_vals)):
-        if i_vals[i] >= i_max * 0.10:
-            if i > 0:
-                dv = u_vals[i] - u_vals[i-1]
-                di = i_vals[i] - i_vals[i-1]
-                if di > 0:
-                    vf = u_vals[i-1] + (i_max * 0.10 - i_vals[i-1]) * dv / di
-                else:
-                    vf = u_vals[i]
-            else:
-                vf = u_vals[i]
-            break
+    vf = next((u[k] for k in range(len(i)) if i[k] > 0.1*imax), u[-1])
 
-    if vf is None:
-        vf = u_vals[-1]
-    vf = round(max(0, vf), 3)
+    best = None
+    best_score = -999
 
-    # Step 2: Estimate n and Is from exponential region
-    Vt = 0.02585
-    pts_exp = [(u, i * 1e-3) for u, i in zip(u_vals, i_vals)
-               if i > i_max * 0.05 and i < i_max * 0.70 and u > 0.05]
-
-    estimated_n = 1.8
-    estimated_Is = 10e-9
-
-    if len(pts_exp) >= 4:
-        try:
-            p1 = pts_exp[len(pts_exp) // 4]
-            p2 = pts_exp[3 * len(pts_exp) // 4]
-            if p2[0] != p1[0] and p2[1] > 0 and p1[1] > 0:
-                n_calc = (p2[0] - p1[0]) / (Vt * math.log(p2[1] / p1[1]))
-                if 0.5 < n_calc < 3.5:
-                    estimated_n = round(n_calc, 2)
-                Is_calc = p1[1] / math.exp(p1[0] / (estimated_n * Vt))
-                if 1e-18 < Is_calc < 1e-3:
-                    estimated_Is = Is_calc
-        except:
-            pass
-
-    # Step 3: Score matching
-    best_match = None
-    best_score = -9999
-    scores = []
-
-    for diode in DIODE_DATABASE:
+    for d in DIODE_DATABASE:
         score = 0
-        if diode["vf_min"] <= vf <= diode["vf_max"]:
-            vf_center = (diode["vf_min"] + diode["vf_max"]) / 2
-            vf_range  = (diode["vf_max"] - diode["vf_min"]) / 2
-            vf_score  = max(0, 1 - abs(vf - vf_center) / max(vf_range, 0.01))
-            score += 60 * vf_score
+
+        # Vf match
+        if d["vf_min"] <= vf <= d["vf_max"]:
+            score += 60
         else:
-            dist = min(abs(vf - diode["vf_min"]), abs(vf - diode["vf_max"]))
-            score -= dist * 40
+            score -= abs(vf - d["vf_min"]) * 30
 
-        n_diff = abs(estimated_n - diode["n"])
-        score += max(0, 25 - n_diff * 20)
+        # realism bonus
+        score += 20 if d["n"] > 1 else 10
 
-        try:
-            is_ratio = math.log10(max(estimated_Is, 1e-18)) - math.log10(diode["Is_nA"] * 1e-9)
-            score += max(0, 15 - abs(is_ratio) * 5)
-        except:
-            pass
-
-        scores.append({"diode": diode, "score": round(score, 1)})
         if score > best_score:
             best_score = score
-            best_match = diode
-
-    confidence = min(98, max(25, int(best_score)))
+            best = d
 
     return {
-        "type": best_match["name"],
-        "model": best_match["model"],
-        "id": best_match["id"],
-        "color": best_match["color"],
-        "description": best_match["description"],
-        "applications": best_match["applications"],
-        "vf": vf,
-        "n": round(estimated_n, 2),
-        "Is_nA": round(estimated_Is * 1e9, 4),
-        "Is_display": f"{estimated_Is*1e9:.3f} nA" if estimated_Is*1e9 >= 0.001 else f"{estimated_Is*1e12:.3f} pA",
-        "confidence": confidence,
-        "scores": sorted(scores, key=lambda x: x["score"], reverse=True)[:4]
+        "type": best["name"],
+        "vf": round(vf,3),
+        "confidence": min(95, max(40, int(best_score))),
+        "n": best["n"],
+        "Is_nA": best["Is_nA"]
     }
 
-
-# ===============================
+# ======================
 # ROUTES
-# ===============================
-@app.route("/")
-def home():
-    return DASHBOARD_HTML
-
-
-@app.route("/status")
-def status():
-    return jsonify({"running": running})
-
-
+# ======================
 @app.route("/start")
 def start():
     global running
     running = True
-    return jsonify({"status": "running"})
-
+    return {"status":"running","interval":sampling_interval}
 
 @app.route("/stop")
 def stop():
     global running
     running = False
-    return jsonify({"status": "stopped"})
+    return {"status":"stopped"}
 
+@app.route("/set_interval/<float:t>")
+def set_interval(t):
+    global sampling_interval
+    sampling_interval = max(0.1, min(5, t))
+    return {"interval":sampling_interval}
 
 @app.route("/reset")
 def reset():
-    global data_store, identified_diode
-    data_store = []
-    identified_diode = None
-    return jsonify({"status": "reset"})
-
+    data_store.clear()
+    return {"status":"reset"}
 
 @app.route("/data", methods=["POST"])
-def receive_data():
-    global data_store, running
+def data():
     if not running:
-        return jsonify({"status": "stopped"})
+        return {"status":"stopped"}
+
     d = request.json
-    U = float(d.get("voltage", 0))
-    I = float(d.get("current", 0))
+    U = float(d.get("voltage",0))
+    I = float(d.get("current",0))
+
     if U >= 0 and I >= 0:
-        data_store.append({"U": round(U, 4), "I": round(I, 4)})
-    return jsonify({"status": "ok"})
+        data_store.append({"U":U,"I":I})
 
-
-@app.route("/data_batch", methods=["POST"])
-def receive_batch():
-    global data_store, running
-    if not running:
-        return jsonify({"status": "stopped"})
-    points = request.json
-    if not isinstance(points, list):
-        return jsonify({"error": "expected array"}), 400
-    new_data = []
-    for d in points:
-        U = float(d.get("voltage", 0))
-        I = float(d.get("current", 0))
-        if U >= 0 and I >= 0:
-            new_data.append({"U": round(U, 4), "I": round(I, 4)})
-    data_store = new_data
-    return jsonify({"status": "ok", "points": len(new_data)})
-
+    return {"ok":True,"size":len(data_store)}
 
 @app.route("/get_data")
 def get_data():
-    return jsonify(data_store)
-
+    return list(data_store)
 
 @app.route("/identify")
-def identify():
+def do_identify():
     global identified_diode
-    if len(data_store) < 8:
-        return jsonify({"error": "not enough data"})
-    result = identify_diode_from_curve(data_store)
-    identified_diode = result
-    return jsonify(result)
+    res = identify(data_store)
+    identified_diode = res
+    return res or {"error":"not enough data"}
 
 
 @app.route("/export_csv")
