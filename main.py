@@ -23,7 +23,6 @@ DIODE_DATABASE = [
         "vf_1mA": 0.18,  "vf_1mA_min": 0.08, "vf_1mA_max": 0.32,
         "vf_5mA": 0.25,  "vf_5mA_min": 0.12, "vf_5mA_max": 0.40,
         "vf_10mA":0.30,  "vf_10mA_min":0.16, "vf_10mA_max":0.45,
-        # ancien format conservé pour compatibilité scoring
         "vf_typ": 0.22, "vf_min": 0.08, "vf_max": 0.38,
         "Is_nA": 120.0, "n_typ": 1.05, "n_min": 0.8, "n_max": 1.3,
         "slope_factor": 3.5, "curvature": 0.85,
@@ -230,22 +229,8 @@ DIODE_DATABASE = [
 
 # ═══════════════════════════════════════════════
 #  ALGORITHME D'IDENTIFICATION ROBUSTE
-#  Utilise des seuils absolus en mA pour Vf
-#  (bien plus fiable que les % du courant max)
 # ═══════════════════════════════════════════════
 def identify_diode_from_curve(data):
-    """
-    Algorithme multi-méthodes avec vote bayésien :
-
-    1. Interpolation Vf à seuils absolus (1 mA, 5 mA, 10 mA)
-       → indépendant de la résistance série et du courant max
-    2. Régression LSQ sur ln(I) = ln(Is) + V/(n·Vt)
-       → extraction robuste de n et Is
-    3. Analyse de pente dI/dV normalisée
-    4. Scoring pondéré multi-critères avec pénalités fortes hors plage
-    5. Séparation explicite diode/LED (veto si Vf incohérent)
-    6. Calibration confiance via R² et gap entre candidats
-    """
     if len(data) < 6:
         return None
 
@@ -254,13 +239,28 @@ def identify_diode_from_curve(data):
     i_vals  = [d['I'] for d in data_s]   # en mA
     Vt      = 0.02585                     # V à T = 300 K
 
+    # ══ CORRECTION BASELINE (0 → 0.2 V) ════════════════════════════════
+    # Tous les composants ont un offset de courant au démarrage
+    # (bruit ADC, courant de fuite, offset MCP4725).
+    # On calcule la moyenne des points entre 0 et 0.2V
+    # et on la soustrait à toute la courbe.
+    baseline_pts = [i for u, i in zip(u_vals, i_vals) if 0.0 <= u <= 0.2]
+    if len(baseline_pts) >= 2:
+        baseline = sum(baseline_pts) / len(baseline_pts)
+    elif len(baseline_pts) == 1:
+        baseline = baseline_pts[0]
+    else:
+        baseline = 0.0
+    # Soustraction et clamp à 0 (le courant ne peut pas être négatif)
+    i_vals = [max(0.0, i - baseline) for i in i_vals]
+    # ════════════════════════════════════════════════════════════════════
+
     i_max = max(i_vals)
     if i_max <= 0:
         return None
 
     # ══ 1. Vf à seuils absolus (mA) ════════════════════════════════════
     def interp_vf_abs(threshold_mA):
-        """Vf interpolé au seuil absolu threshold_mA — méthode principale."""
         for k in range(len(u_vals)):
             if i_vals[k] >= threshold_mA:
                 if k > 0 and (i_vals[k] - i_vals[k - 1]) > 1e-9:
@@ -268,14 +268,12 @@ def identify_diode_from_curve(data):
                     di = i_vals[k] - i_vals[k - 1]
                     return u_vals[k - 1] + (threshold_mA - i_vals[k - 1]) * dv / di
                 return u_vals[k]
-        return None   # seuil jamais atteint dans la mesure
+        return None
 
-    # Vf aux trois seuils clés
     vf_1mA  = interp_vf_abs(1.0)
     vf_5mA  = interp_vf_abs(5.0)
     vf_10mA = interp_vf_abs(10.0)
 
-    # Vf à pourcentages (compatibilité affichage)
     def interp_vf_pct(pct):
         target = i_max * pct
         for k in range(len(u_vals)):
@@ -330,7 +328,7 @@ def identify_diode_from_curve(data):
         except Exception:
             pass
 
-    # ══ 3. Onset sharpness (robustesse bruit) ═══════════════════════════
+    # ══ 3. Onset sharpness ══════════════════════════════════════════════
     onset_sharpness = (vf_30pct - vf_5pct) / max(vf_5pct, 0.01)
 
     # ══ 4. Pente normalisée max ══════════════════════════════════════════
@@ -344,19 +342,6 @@ def identify_diode_from_curve(data):
                 max_slope_norm = sl_loc
 
     # ══ 5. SCORING multi-critères ═══════════════════════════════════════
-    #
-    #  Pondération :
-    #    Vf absolu (1 mA)  → 40 pts  (critère principal)
-    #    Vf absolu (5 mA)  → 20 pts  (confirmation)
-    #    Vf absolu (10 mA) → 15 pts  (confirmation forte courant)
-    #    n (idéalité)      → 15 pts
-    #    Is                →  8 pts
-    #    onset sharpness   →  5 pts  (forme de la courbe)
-    #    bonus R²/cohérence→  5 pts  bonus
-    #
-    #  Veto absolu : si aucun des seuils Vf n'est dans la plage → score = 0
-    #  Séparation diode/LED garantie par les plages non-overlapping
-
     scores = []
     for diode in DIODE_DATABASE:
         score = 0.0
@@ -372,7 +357,7 @@ def identify_diode_from_curve(data):
                 gap = min(abs(vf_1mA - lo), abs(vf_1mA - hi))
                 score -= gap * 80.0
                 if gap > 0.30:
-                    veto = True   # trop loin, penalité forte
+                    veto = True
 
         # ── Critère Vf à 5 mA (20 pts) ──
         if vf_5mA is not None:
@@ -394,7 +379,7 @@ def identify_diode_from_curve(data):
                 gap = min(abs(vf_10mA - lo), abs(vf_10mA - hi))
                 score -= gap * 30.0
 
-        # ── Critère n, facteur d'idéalité (15 pts) ──
+        # ── Critère n idéalité (15 pts) ──
         n_typ = diode["n_typ"]
         n_min = diode["n_min"]
         n_max = diode["n_max"]
@@ -422,7 +407,7 @@ def identify_diode_from_curve(data):
         if r2_exp > 0.92 and n_min <= estimated_n <= n_max:
             score += 5.0 * r2_exp
 
-        # ── Bonus Vf 5 mA dans la plage large ──
+        # ── Bonus Vf 5 mA dans la plage ──
         if vf_5mA is not None and diode["vf_5mA_min"] <= vf_5mA <= diode["vf_5mA_max"]:
             score += 2.0
 
@@ -442,14 +427,13 @@ def identify_diode_from_curve(data):
     # ══ 6. Calibration de la confiance ══════════════════════════════════
     conf = min(95, max(15, int(best_score * 0.75 + gap * 0.50)))
     conf = min(97, conf + int(r2_exp * 8))
-    # Bonus si Vf 1 mA très proche du typique
     if vf_1mA is not None:
         if abs(vf_1mA - best["vf_1mA"]) < 0.02:
             conf = min(99, conf + 6)
         elif abs(vf_1mA - best["vf_1mA"]) < 0.06:
             conf = min(99, conf + 3)
 
-    # ══ 7. Votes méthodes (pour affichage debug) ════════════════════════
+    # ══ 7. Votes méthodes ═══════════════════════════════════════════════
     method_votes = []
     if vf_1mA is not None:
         ok = best["vf_1mA_min"] <= vf_1mA <= best["vf_1mA_max"]
@@ -462,8 +446,9 @@ def identify_diode_from_curve(data):
         method_votes.append({"label": "Vf@10mA", "result": f"{vf_10mA:.3f}V", "ok": ok})
     n_ok = best["n_min"] <= estimated_n <= best["n_max"]
     method_votes.append({"label": f"n={estimated_n:.3f}", "result": best["name"], "ok": n_ok})
+    # Badge baseline pour debug
+    method_votes.append({"label": "baseline", "result": f"{baseline:.4f}mA", "ok": True})
 
-    # Format Is pour affichage
     if estimated_Is * 1e9 >= 0.001:
         is_display = f"{estimated_Is * 1e9:.4f} nA"
     else:
@@ -478,23 +463,21 @@ def identify_diode_from_curve(data):
         "applications":    best.get("applications", "—"),
         "tech":            best.get("tech", "diode"),
         "wavelength":      best.get("wavelength", 0),
-        # Vf aux seuils absolus
         "vf_1mA":          round(vf_1mA, 3)  if vf_1mA  is not None else None,
         "vf_5mA":          round(vf_5mA, 3)  if vf_5mA  is not None else None,
         "vf_10mA":         round(vf_10mA, 3) if vf_10mA is not None else None,
-        # Vf aux pourcentages (affichage badges)
         "vf":              round(vf_10pct, 3),
         "vf_5pct":         round(vf_5pct,  3),
         "vf_10pct":        round(vf_10pct, 3),
         "vf_20pct":        round(vf_20pct, 3),
         "vf_30pct":        round(vf_30pct, 3),
-        # Paramètres Shockley
         "n":               round(estimated_n,  3),
         "Is_nA":           round(estimated_Is * 1e9, 6),
         "Is_display":      is_display,
         "r2_exp":          round(r2_exp, 4),
         "onset_sharpness": round(onset_sharpness, 3),
         "confidence":      conf,
+        "baseline_mA":     round(baseline, 4),   # ← nouveau
         "scores":          scores[:8],
         "method_votes":    method_votes,
     }
@@ -507,11 +490,9 @@ def identify_diode_from_curve(data):
 def home():
     return DASHBOARD_HTML
 
-
 @app.route("/status")
 def status():
     return jsonify({"running": running})
-
 
 @app.route("/start")
 def start():
@@ -521,13 +502,11 @@ def start():
     running          = True
     return jsonify({"status": "running"})
 
-
 @app.route("/stop")
 def stop():
     global running
     running = False
     return jsonify({"status": "stopped"})
-
 
 @app.route("/reset")
 def reset():
@@ -535,7 +514,6 @@ def reset():
     data_store       = []
     identified_diode = None
     return jsonify({"status": "reset"})
-
 
 @app.route("/data", methods=["POST"])
 def receive_data():
@@ -548,7 +526,6 @@ def receive_data():
     if U >= 0 and I >= 0:
         data_store.append({"U": round(U, 4), "I": round(I, 4)})
     return jsonify({"status": "ok"})
-
 
 @app.route("/data_batch", methods=["POST"])
 def receive_batch():
@@ -567,11 +544,9 @@ def receive_batch():
     data_store = new_data
     return jsonify({"status": "ok", "points": len(new_data)})
 
-
 @app.route("/get_data")
 def get_data():
     return jsonify(data_store)
-
 
 @app.route("/identify")
 def identify():
@@ -584,7 +559,6 @@ def identify():
     identified_diode = result
     return jsonify(result)
 
-
 @app.route("/export_csv")
 def export_csv():
     csv_data = "U(V),I(mA)\n" + "".join(
@@ -594,7 +568,6 @@ def export_csv():
         "Content-Type": "text/csv",
         "Content-Disposition": "attachment; filename=mesures_diode.csv"
     }
-
 
 @app.route("/export_pdf")
 def export_pdf():
@@ -655,20 +628,21 @@ def export_pdf():
 
     if identified_diode:
         elements.append(T("Identification du Composant", s_section))
-        vf1 = identified_diode.get("vf_1mA")
-        vf5 = identified_diode.get("vf_5mA")
+        vf1  = identified_diode.get("vf_1mA")
+        vf5  = identified_diode.get("vf_5mA")
         vf10 = identified_diode.get("vf_10mA")
         id_rows = [
-            ["Type identifié",          f"{identified_diode['type']} ({identified_diode['model']})"],
-            ["Description",             identified_diode["description"]],
-            ["Applications",            identified_diode.get("applications", "—")],
-            ["Vf à 1 mA",              f"{vf1} V" if vf1 is not None else "—"],
-            ["Vf à 5 mA",              f"{vf5} V" if vf5 is not None else "—"],
-            ["Vf à 10 mA",             f"{vf10} V" if vf10 is not None else "—"],
-            ["Facteur d'idéalité n",    str(identified_diode["n"])],
-            ["Courant de saturation Is",identified_diode.get("Is_display", "—")],
-            ["R² régression exp.",      str(identified_diode.get("r2_exp", "—"))],
-            ["Niveau de confiance",     f"{identified_diode['confidence']} %"],
+            ["Type identifié",           f"{identified_diode['type']} ({identified_diode['model']})"],
+            ["Description",              identified_diode["description"]],
+            ["Applications",             identified_diode.get("applications", "—")],
+            ["Vf à 1 mA",               f"{vf1} V"  if vf1  is not None else "—"],
+            ["Vf à 5 mA",               f"{vf5} V"  if vf5  is not None else "—"],
+            ["Vf à 10 mA",              f"{vf10} V" if vf10 is not None else "—"],
+            ["Facteur d'idéalité n",     str(identified_diode["n"])],
+            ["Courant de saturation Is", identified_diode.get("Is_display", "—")],
+            ["R² régression exp.",       str(identified_diode.get("r2_exp", "—"))],
+            ["Baseline soustraite",      f"{identified_diode.get('baseline_mA', 0):.4f} mA"],
+            ["Niveau de confiance",      f"{identified_diode['confidence']} %"],
         ]
         elements += [styled_table(id_rows, [5.5*cm, 10.5*cm]), Spacer(1, 0.4*cm)]
 
@@ -689,9 +663,9 @@ def export_pdf():
         elements.append(HR())
         elements.append(T("Courbe Caractéristique I = f(U)", s_section))
         u_vals = [d['U'] for d in data_store]
-        i_vals = [d['I'] for d in data_store]
+        i_vals_raw = [d['I'] for d in data_store]
         fig, ax = plt.subplots(figsize=(7.5, 4))
-        ax.plot(u_vals, i_vals, color='#1e6ab0', linewidth=2.5,
+        ax.plot(u_vals, i_vals_raw, color='#1e6ab0', linewidth=2.5,
                 marker='o', markersize=3, label='Mesure réelle', zorder=3)
         if identified_diode:
             Is  = identified_diode['Is_nA'] * 1e-9
@@ -758,11 +732,6 @@ def export_pdf():
 
 # ═══════════════════════════════════════════════
 #  DASHBOARD HTML
-#  • Interface propre et professionnelle
-#  • Boutons "Effacer mesure" et "Effacer théorique" indépendants
-#  • Courbe théorique auto-tracée après identification
-#  • Vf affiché aux seuils absolus (1 mA, 5 mA, 10 mA)
-#  • Votes méthodes visibles pour debug
 # ═══════════════════════════════════════════════
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="fr">
@@ -791,8 +760,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;background:var(--bg);font-family:var(--sans);color:var(--text);overflow-x:hidden}
-
-/* ── HEADER ── */
 .header{
   height:54px;display:flex;align-items:center;justify-content:space-between;
   padding:0 20px;background:var(--surface);border-bottom:1px solid var(--border);
@@ -815,13 +782,9 @@ html,body{height:100%;background:var(--bg);font-family:var(--sans);color:var(--t
 .sdot.live{background:var(--green);animation:pulse 1.2s infinite}
 .sdot.stop{background:var(--red)}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.8)}}
-
-/* ── LAYOUT ── */
 .layout{display:grid;grid-template-columns:210px 1fr 270px;gap:10px;
   padding:10px;min-height:calc(100vh - 54px)}
 .col{display:flex;flex-direction:column;gap:10px}
-
-/* ── PANEL ── */
 .panel{background:var(--surface);border:1px solid var(--border);
   border-radius:var(--radius);padding:14px}
 .panel-hd{display:flex;align-items:center;gap:7px;margin-bottom:12px;
@@ -829,8 +792,6 @@ html,body{height:100%;background:var(--bg);font-family:var(--sans);color:var(--t
 .panel-hd i{font-size:16px;color:var(--blue)}
 .panel-title{font-size:10px;font-weight:600;letter-spacing:1.2px;
   text-transform:uppercase;color:var(--muted)}
-
-/* ── FORM ── */
 label{display:block;font-size:10px;font-weight:500;color:var(--muted);
   letter-spacing:.5px;text-transform:uppercase;margin-bottom:3px;margin-top:8px}
 label:first-of-type{margin-top:0}
@@ -841,8 +802,6 @@ input[type="number"],select{
   transition:border .15s;-moz-appearance:textfield;outline:none}
 input[type="number"]::-webkit-inner-spin-button{-webkit-appearance:none}
 input:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(24,95,165,.10)}
-
-/* ── BUTTONS ── */
 .btn{
   width:100%;padding:8px 12px;border-radius:var(--radius-sm);font-family:var(--sans);
   font-size:12px;font-weight:500;cursor:pointer;transition:all .15s;
@@ -860,16 +819,11 @@ input:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(24,9
 .btn-stop:hover{background:#F7C1C1;border-color:var(--red)}
 .btn-id{background:var(--blue-lt);color:var(--blue-dk);border-color:#B5D4F4;padding:10px 12px;font-size:13px}
 .btn-id:hover:not(:disabled){background:#B5D4F4;border-color:var(--blue)}
-.btn-sm{font-size:10px;padding:5px 8px;width:auto}
-
-/* ── LIVE ── */
 .live-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
 .live-box{background:var(--surface2);border:1px solid var(--border);
   border-radius:var(--radius-sm);padding:8px;text-align:center}
 .live-val{font-family:var(--mono);font-size:19px;font-weight:600;line-height:1;transition:color .3s}
 .live-lbl{font-size:9px;color:var(--muted);margin-top:2px;letter-spacing:.5px;text-transform:uppercase}
-
-/* ── CHART ── */
 .chart-wrap{flex:1;position:relative;min-height:300px}
 canvas{width:100%!important;height:100%!important}
 .axes-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin-top:8px}
@@ -877,8 +831,6 @@ canvas{width:100%!important;height:100%!important}
 .axes-grid input{font-size:11px;padding:5px 7px}
 .axes-btns{display:flex;gap:6px;margin-top:6px}
 .axes-btns .btn{flex:1;font-size:10px;padding:5px 6px}
-
-/* ── TABLE ── */
 .tbl-wrap{flex:1;overflow-y:auto;max-height:170px;border:1px solid var(--border);
   border-radius:var(--radius-sm);scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
 table{width:100%;border-collapse:collapse}
@@ -888,8 +840,6 @@ thead th{background:var(--surface2);padding:5px 8px;color:var(--muted);font-size
 tbody td{padding:4px 8px;text-align:center;border-bottom:1px solid var(--border);
   font-family:var(--mono);font-size:11px;color:var(--muted)}
 tbody tr:hover td{background:var(--surface2);color:var(--text)}
-
-/* ── RIGHT PANEL ── */
 .right-col{overflow-y:auto;max-height:calc(100vh - 74px);
   scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
 .id-card{border:1px solid var(--border);border-radius:var(--radius-sm);
@@ -919,10 +869,10 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
   border-radius:var(--radius-sm);border-left:2px solid var(--green)}
 .apps-lbl{font-size:9px;color:var(--green);font-weight:600;text-transform:uppercase;letter-spacing:.8px}
 .apps-txt{font-size:10px;color:var(--green-dk);margin-top:2px;line-height:1.5}
-.r2-row{display:flex;align-items:center;gap:8px;margin-top:6px;
-  padding:5px 8px;background:var(--surface2);border:1px solid var(--border);
-  border-radius:var(--radius-sm);font-size:11px}
-.r2-lbl{flex:1;color:var(--muted)}
+.baseline-info{display:flex;align-items:center;gap:6px;margin-top:6px;
+  padding:5px 8px;background:var(--purple-lt);border:1px solid #C5C1F5;
+  border-radius:var(--radius-sm);font-size:10px;color:var(--purple)}
+.baseline-info i{font-size:13px}
 .votes{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
 .vote-badge{font-size:9px;padding:2px 7px;border-radius:4px;font-weight:600;font-family:var(--mono)}
 .vote-ok{background:var(--green-lt);color:var(--green-dk)}
@@ -950,8 +900,6 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
   cursor:pointer;display:flex;align-items:center;gap:4px;transition:all .15s;font-family:var(--sans)}
 .curve-btn:hover{background:var(--surface2);color:var(--text);border-color:var(--blue)}
 .curve-btn i{font-size:13px}
-
-/* ── TOAST ── */
 .toast{position:fixed;bottom:18px;right:18px;z-index:999;
   padding:9px 16px;border-radius:var(--radius-sm);font-size:12px;font-weight:500;
   background:var(--surface);border:1px solid var(--border2);color:var(--text);
@@ -963,10 +911,9 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
 </style>
 </head>
 <body>
-
 <header class="header">
   <div class="logo">
-    <div class="logo-icon"><i class="ti ti-bolt" aria-hidden="true"></i></div>
+    <div class="logo-icon"><i class="ti ti-bolt"></i></div>
     <div>
       <div class="logo-name">Smart Diode Dashboard</div>
       <div class="logo-sub">ESP32 · MCP4725 · IA Identification</div>
@@ -993,12 +940,11 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
 </header>
 
 <div class="layout">
-
   <!-- ══ GAUCHE ══ -->
   <div class="col">
     <div class="panel">
       <div class="panel-hd">
-        <i class="ti ti-adjustments-horizontal" aria-hidden="true"></i>
+        <i class="ti ti-adjustments-horizontal"></i>
         <span class="panel-title">Contrôle</span>
       </div>
       <label>Composant</label>
@@ -1008,15 +954,14 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
       <label>Pas (V)</label>
       <input type="number" id="vstep" value="0.02" step="0.01" min="0.005">
       <div style="margin-top:12px">
-        <button class="btn btn-start" onclick="startSweep()"><i class="ti ti-player-play" aria-hidden="true"></i> Start sweep</button>
-        <button class="btn btn-stop"  onclick="stopSweep()"><i class="ti ti-player-stop" aria-hidden="true"></i> Stop</button>
-        <button class="btn"           onclick="resetAll()"><i class="ti ti-refresh" aria-hidden="true"></i> Reset tout</button>
+        <button class="btn btn-start" onclick="startSweep()"><i class="ti ti-player-play"></i> Start sweep</button>
+        <button class="btn btn-stop"  onclick="stopSweep()"><i class="ti ti-player-stop"></i> Stop</button>
+        <button class="btn"           onclick="resetAll()"><i class="ti ti-refresh"></i> Reset tout</button>
       </div>
     </div>
-
     <div class="panel">
       <div class="panel-hd">
-        <i class="ti ti-bolt" aria-hidden="true"></i>
+        <i class="ti ti-bolt"></i>
         <span class="panel-title">Mesure live</span>
       </div>
       <div class="live-grid">
@@ -1030,10 +975,9 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
         </div>
       </div>
     </div>
-
     <div class="panel" style="flex:1;display:flex;flex-direction:column;min-height:0">
       <div class="panel-hd">
-        <i class="ti ti-table" aria-hidden="true"></i>
+        <i class="ti ti-table"></i>
         <span class="panel-title">Données</span>
         <span id="pts-lbl" style="margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--muted)">0 pts</span>
       </div>
@@ -1050,16 +994,16 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
   <div class="col">
     <div class="panel" style="flex:1;display:flex;flex-direction:column">
       <div class="panel-hd">
-        <i class="ti ti-chart-line" aria-hidden="true"></i>
+        <i class="ti ti-chart-line"></i>
         <span class="panel-title">Courbe I = f(U)</span>
         <div class="curve-btns">
-          <button class="curve-btn" onclick="clearMeasured()"><i class="ti ti-eraser" aria-hidden="true"></i> Effacer mesure</button>
-          <button class="curve-btn" onclick="clearTheory()"><i class="ti ti-line-dashed" aria-hidden="true"></i> Effacer théorique</button>
+          <button class="curve-btn" onclick="clearMeasured()"><i class="ti ti-eraser"></i> Effacer mesure</button>
+          <button class="curve-btn" onclick="clearTheory()"><i class="ti ti-line-dashed"></i> Effacer théorique</button>
         </div>
         <span style="font-size:9px;color:var(--hint);margin-left:6px">Scroll = zoom · Drag = pan</span>
       </div>
       <div class="chart-wrap">
-        <canvas id="chart" role="img" aria-label="Courbe I-U diode ou LED"></canvas>
+        <canvas id="chart"></canvas>
       </div>
       <div>
         <div class="axes-grid">
@@ -1069,15 +1013,14 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
           <div><label>Y max</label><input type="number" id="ymax" value="2"   step="0.1"  oninput="applyAxes()"></div>
         </div>
         <div class="axes-btns">
-          <button class="btn" onclick="chart.resetZoom()"><i class="ti ti-zoom-reset" aria-hidden="true"></i> Reset zoom</button>
-          <button class="btn" onclick="autoScale()"><i class="ti ti-arrows-maximize" aria-hidden="true"></i> Auto scale</button>
+          <button class="btn" onclick="chart.resetZoom()"><i class="ti ti-zoom-reset"></i> Reset zoom</button>
+          <button class="btn" onclick="autoScale()"><i class="ti ti-arrows-maximize"></i> Auto scale</button>
         </div>
       </div>
     </div>
-
     <div class="panel">
       <div class="panel-hd">
-        <i class="ti ti-math-function" aria-hidden="true"></i>
+        <i class="ti ti-math-function"></i>
         <span class="panel-title">Shockley manuel</span>
       </div>
       <div class="shockley-row">
@@ -1094,11 +1037,11 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
   <div class="col right-col">
     <div class="panel">
       <div class="panel-hd">
-        <i class="ti ti-cpu" aria-hidden="true"></i>
+        <i class="ti ti-cpu"></i>
         <span class="panel-title">Identification IA</span>
       </div>
       <button class="btn btn-id" id="btn-id" onclick="identify()">
-        <i class="ti ti-search" aria-hidden="true"></i> Identifier diode / LED
+        <i class="ti ti-search"></i> Identifier diode / LED
       </button>
       <div class="hint" id="id-hint">Minimum 6 points requis</div>
       <div id="id-result" style="display:none">
@@ -1111,8 +1054,6 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
             <div id="id-dot" style="width:12px;height:12px;border-radius:50%;flex-shrink:0;margin-top:4px"></div>
           </div>
           <div class="id-desc" id="id-desc">—</div>
-
-          <!-- Vf aux seuils absolus -->
           <div class="vf-seuils">
             <div class="vf-item">
               <div class="vf-item-lbl">Vf @ 1 mA</div>
@@ -1127,40 +1068,38 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
               <div class="vf-item-val" id="vf-10" style="color:var(--amber)">—</div>
             </div>
           </div>
-
           <div class="params-grid">
             <div class="param"><div class="param-name">n idéalité</div><div class="param-val" id="p-n">—</div></div>
             <div class="param"><div class="param-name">Is</div><div class="param-val" id="p-is" style="font-size:9px">—</div></div>
             <div class="param"><div class="param-name">R²</div><div class="param-val" id="p-r2">—</div></div>
           </div>
-
-          <!-- Votes méthodes -->
+          <!-- Bandeau baseline -->
+          <div class="baseline-info" id="baseline-row" style="display:none">
+            <i class="ti ti-filter"></i>
+            <span>Baseline soustraite : <strong id="baseline-val">—</strong> mA</span>
+          </div>
           <div class="votes" id="votes"></div>
-
           <div class="conf-row">
             <span class="conf-lbl">Confiance</span>
             <div class="conf-bar"><div class="conf-fill" id="conf-fill" style="width:0%"></div></div>
             <span class="conf-pct" id="conf-pct">—</span>
           </div>
-
           <div class="apps-box">
             <div class="apps-lbl">Applications</div>
             <div class="apps-txt" id="id-apps">—</div>
           </div>
-
           <div class="cands" id="cands"></div>
         </div>
       </div>
     </div>
-
     <div class="panel">
       <div class="panel-hd">
-        <i class="ti ti-download" aria-hidden="true"></i>
+        <i class="ti ti-download"></i>
         <span class="panel-title">Export</span>
       </div>
       <div class="export-row">
-        <button class="btn" onclick="window.location.href='/export_csv'"><i class="ti ti-file-type-csv" aria-hidden="true"></i> CSV</button>
-        <button class="btn" onclick="window.location.href='/export_pdf'"><i class="ti ti-file-type-pdf" aria-hidden="true"></i> PDF</button>
+        <button class="btn" onclick="window.location.href='/export_csv'"><i class="ti ti-file-type-csv"></i> CSV</button>
+        <button class="btn" onclick="window.location.href='/export_pdf'"><i class="ti ti-file-type-pdf"></i> PDF</button>
       </div>
     </div>
   </div>
@@ -1179,29 +1118,22 @@ function toast(msg, type='info', ms=2500){
   el._t = setTimeout(()=>{ el.className = 'toast'; }, ms);
 }
 
-// ── Chart ──────────────────────────────────────
 function initChart(){
   const ctx = document.getElementById('chart').getContext('2d');
   chart = new Chart(ctx, {
     type: 'line',
     data: { datasets: [
-      {
-        label:'Mesure réelle', data:[], order:1,
+      { label:'Mesure réelle', data:[], order:1,
         borderColor:'#378ADD', backgroundColor:'rgba(55,138,221,0.07)',
-        pointRadius:2.5, pointHoverRadius:6, borderWidth:2, tension:.25, fill:true
-      },
-      {
-        label:'Shockley manuel', data:[], order:3,
+        pointRadius:2.5, pointHoverRadius:6, borderWidth:2, tension:.25, fill:true },
+      { label:'Shockley manuel', data:[], order:3,
         borderColor:'#E24B4A', backgroundColor:'transparent',
         pointRadius:0, borderWidth:1.5, showLine:true, tension:.4,
-        segment:{borderDash:[6,3]}
-      },
-      {
-        label:'Théorique identifiée', data:[], order:2,
+        segment:{borderDash:[6,3]} },
+      { label:'Théorique identifiée', data:[], order:2,
         borderColor:'#BA7517', backgroundColor:'transparent',
         pointRadius:0, borderWidth:2.5, showLine:true, tension:.4, hidden:true,
-        segment:{borderDash:[4,3]}
-      }
+        segment:{borderDash:[4,3]} }
     ]},
     options:{
       responsive:true, maintainAspectRatio:false, animation:false, parsing:false,
@@ -1226,19 +1158,16 @@ function initChart(){
         x:{ type:'linear', min:0, max:3.3,
           title:{display:true, text:'U (V)', color:'#64748b', font:{size:11}},
           ticks:{color:'#94a3b8', font:{size:10}, maxTicksLimit:10},
-          grid:{color:'rgba(0,0,0,0.05)'}
-        },
+          grid:{color:'rgba(0,0,0,0.05)'} },
         y:{ min:0, max:2,
           title:{display:true, text:'I (mA)', color:'#64748b', font:{size:11}},
           ticks:{color:'#94a3b8', font:{size:10}},
-          grid:{color:'rgba(0,0,0,0.05)'}
-        }
+          grid:{color:'rgba(0,0,0,0.05)'} }
       }
     }
   });
 }
 
-// ── Shockley ───────────────────────────────────
 function shockleyPts(Is_nA, n, Vt_mV, xmax, steps=500){
   const Is = Is_nA * 1e-9, Vt = Vt_mV * 1e-3, pts = [];
   for(let i = 0; i <= steps; i++){
@@ -1269,7 +1198,6 @@ function drawTheory(res){
   chart.update('none');
 }
 
-// ── Axes ───────────────────────────────────────
 function applyAxes(){
   const xmin = +document.getElementById('xmin').value || 0;
   const xmax = +document.getElementById('xmax').value || 3.3;
@@ -1295,7 +1223,6 @@ function autoScale(){
   applyAxes();
 }
 
-// ── Efface individuel ──────────────────────────
 function clearMeasured(){
   chart.data.datasets[0].data = [];
   chart.update('none');
@@ -1309,7 +1236,6 @@ function clearTheory(){
   toast('Courbe théorique effacée', 'info');
 }
 
-// ── Status ─────────────────────────────────────
 function setStatus(s){
   const dot = document.getElementById('sdot');
   const txt = document.getElementById('stxt');
@@ -1319,7 +1245,6 @@ function setStatus(s){
   else { txt.textContent = 'Idle'; }
 }
 
-// ── Contrôles ──────────────────────────────────
 function startSweep(){
   fetch('/start').catch(()=>{}).finally(()=>{
     isRunning = true; setStatus('live');
@@ -1331,7 +1256,7 @@ function startSweep(){
     document.getElementById('id-hint').textContent = 'Minimum 6 points requis';
     document.getElementById('pts-lbl').textContent = '0 pts';
     chart.update('none');
-    toast('Sweep démarré — données réinitialisées', 'info');
+    toast('Sweep démarré', 'info');
   });
 }
 
@@ -1363,31 +1288,25 @@ function resetAll(){
   });
 }
 
-// ── Identification ─────────────────────────────
 function identify(){
   const btn = document.getElementById('btn-id');
   btn.disabled = true;
-  btn.innerHTML = '<i class="ti ti-loader-2" aria-hidden="true"></i> Analyse en cours...';
-
+  btn.innerHTML = '<i class="ti ti-loader-2"></i> Analyse en cours...';
   fetch('/identify').then(r => r.json()).then(res => {
     btn.disabled = false;
-    btn.innerHTML = '<i class="ti ti-search" aria-hidden="true"></i> Identifier diode / LED';
-
+    btn.innerHTML = '<i class="ti ti-search"></i> Identifier diode / LED';
     if(res.error){
       toast('⚠ ' + (res.error === 'not enough data' ? 'Minimum 6 points requis' : res.error), 'err', 3000);
       document.getElementById('id-hint').textContent =
         res.error === 'not enough data' ? 'Minimum 6 points requis' : res.error;
       return;
     }
-
     currentRes = res;
     document.getElementById('id-hint').textContent = '';
     document.getElementById('id-result').style.display = 'block';
-
     const card = document.getElementById('id-card');
     card.style.borderColor = res.color;
     card.style.boxShadow   = `0 0 0 3px ${res.color}20`;
-
     document.getElementById('id-dot').style.cssText =
       `background:${res.color};width:12px;height:12px;border-radius:50%;flex-shrink:0;margin-top:4px`;
     document.getElementById('id-type').textContent  = res.type;
@@ -1395,39 +1314,37 @@ function identify(){
     document.getElementById('id-model').textContent = res.model;
     document.getElementById('id-desc').textContent  = res.description;
     document.getElementById('id-apps').textContent  = res.applications;
-
-    // Vf aux seuils absolus
-    document.getElementById('vf-1').textContent  = res.vf_1mA  !== null ? res.vf_1mA  + ' V' : '— ';
-    document.getElementById('vf-5').textContent  = res.vf_5mA  !== null ? res.vf_5mA  + ' V' : '— ';
-    document.getElementById('vf-10').textContent = res.vf_10mA !== null ? res.vf_10mA + ' V' : '— ';
-
+    document.getElementById('vf-1').textContent  = res.vf_1mA  !== null ? res.vf_1mA  + ' V' : '—';
+    document.getElementById('vf-5').textContent  = res.vf_5mA  !== null ? res.vf_5mA  + ' V' : '—';
+    document.getElementById('vf-10').textContent = res.vf_10mA !== null ? res.vf_10mA + ' V' : '—';
     document.getElementById('p-n').textContent  = res.n;
     document.getElementById('p-is').textContent = res.Is_display;
-
     const r2 = res.r2_exp;
     const r2el = document.getElementById('p-r2');
-    r2el.textContent  = r2.toFixed(3);
-    r2el.style.color  = r2 > 0.95 ? 'var(--green)' : r2 > 0.85 ? 'var(--amber)' : 'var(--red)';
-
+    r2el.textContent = r2.toFixed(3);
+    r2el.style.color = r2 > 0.95 ? 'var(--green)' : r2 > 0.85 ? 'var(--amber)' : 'var(--red)';
+    // Affichage baseline
+    if(res.baseline_mA !== undefined && res.baseline_mA > 0.001){
+      document.getElementById('baseline-row').style.display = 'flex';
+      document.getElementById('baseline-val').textContent = res.baseline_mA.toFixed(4);
+    } else {
+      document.getElementById('baseline-row').style.display = 'none';
+    }
     const conf = res.confidence;
     const cc   = conf > 75 ? 'var(--green)' : conf > 45 ? 'var(--amber)' : 'var(--red)';
-    document.getElementById('conf-pct').textContent  = conf + ' %';
-    document.getElementById('conf-pct').style.color  = cc;
+    document.getElementById('conf-pct').textContent = conf + ' %';
+    document.getElementById('conf-pct').style.color = cc;
     const fill = document.getElementById('conf-fill');
     fill.style.width      = conf + '%';
     fill.style.background = conf > 75 ? '#3B6D11' : conf > 45 ? '#854F0B' : '#A32D2D';
-
-    // Votes méthodes
     const votesEl = document.getElementById('votes');
     votesEl.innerHTML = '';
     (res.method_votes || []).forEach(v => {
       const sp = document.createElement('span');
-      sp.className = 'vote-badge ' + (v.ok ? 'vote-ok' : 'vote-warn');
+      sp.className   = 'vote-badge ' + (v.ok ? 'vote-ok' : 'vote-warn');
       sp.textContent = v.label + ' → ' + v.result;
       votesEl.appendChild(sp);
     });
-
-    // Candidats
     if(res.scores && res.scores.length > 1){
       const maxSc = Math.max(1, res.scores[0].score);
       let html = '<div class="cand-title">Autres candidats</div>';
@@ -1442,29 +1359,24 @@ function identify(){
       });
       document.getElementById('cands').innerHTML = html;
     }
-
-    // Sync Shockley
     document.getElementById('Is_v').value = res.Is_nA.toFixed(4);
     document.getElementById('n_v').value  = res.n;
     updateShockley();
     drawTheory(res);
-
     toast('✓ ' + res.type + ' — confiance ' + conf + ' %', 'ok', 3000);
   }).catch(() => {
     btn.disabled = false;
-    btn.innerHTML = '<i class="ti ti-search" aria-hidden="true"></i> Identifier diode / LED';
+    btn.innerHTML = '<i class="ti ti-search"></i> Identifier diode / LED';
     toast('Erreur connexion serveur', 'err');
   });
 }
 
-// ── Polling ────────────────────────────────────
 function updateLive(){
   fetch('/get_data').then(r => r.json()).then(data => {
     chart.data.datasets[0].data = data.map(d => ({x: +d.U, y: +d.I}));
     chart.update('none');
-    const n   = data.length;
-    const lbl = n + ' pts';
-    document.getElementById('pts-lbl').textContent = lbl;
+    const n = data.length;
+    document.getElementById('pts-lbl').textContent = n + ' pts';
     document.getElementById('hpts').innerHTML = n + '<span style="font-size:10px;color:var(--muted)"> pts</span>';
     const sl = data.slice(-80);
     document.getElementById('tbody').innerHTML = sl.map((d, i) =>
@@ -1475,8 +1387,8 @@ function updateLive(){
       const U = (+last.U).toFixed(3), I = (+last.I).toFixed(3);
       document.getElementById('lv').textContent = U;
       document.getElementById('li').textContent = I;
-      document.getElementById('hv').innerHTML  = U + '<span style="font-size:10px;color:var(--muted)"> V</span>';
-      document.getElementById('hi').innerHTML  = I + '<span style="font-size:10px;color:var(--muted)"> mA</span>';
+      document.getElementById('hv').innerHTML = U + '<span style="font-size:10px;color:var(--muted)"> V</span>';
+      document.getElementById('hi').innerHTML = I + '<span style="font-size:10px;color:var(--muted)"> mA</span>';
     }
   }).catch(() => {});
 }
