@@ -48,21 +48,6 @@ DIODE_DATABASE = [
         "applications": "Détection AM, démodulation, circuits vintage, radio à galène.",
     },
     {
-        "id": "silicon_signal",
-        "name": "Silicium signal",
-        "model": "1N4148 / 1N914 / BAV99",
-        "color": "#2196f3",
-        "description": "Diode Si signal rapide — polyvalente, switching ns, très répandue.",
-        "vf_1mA": 0.48,  "vf_1mA_min": 0.35, "vf_1mA_max": 0.62,
-        "vf_5mA": 0.58,  "vf_5mA_min": 0.44, "vf_5mA_max": 0.72,
-        "vf_10mA":0.65,  "vf_10mA_min":0.50, "vf_10mA_max":0.80,
-        "vf_typ": 0.52, "vf_min": 0.38, "vf_max": 0.62,
-        "Is_nA": 8.0, "n_typ": 1.5, "n_min": 1.2, "n_max": 1.8,
-        "slope_factor": 2.8, "curvature": 0.72,
-        "tech": "diode",
-        "applications": "Switching logique, démodulation, protection ESD, redressement signal.",
-    },
-    {
         "id": "silicon_rect",
         "name": "Silicium redresseur",
         # ✅ FIX 4 : 1N4007 explicite dans le nom
