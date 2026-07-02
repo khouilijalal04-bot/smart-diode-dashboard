@@ -407,10 +407,12 @@ def start():
     current_ib_label = body.get("ib_label", "IB1")
     reset_data       = body.get("reset", True)
     if reset_data:
-        data_store       = []
-        bjt_store        = {}
-        identified_diode = None
-        bjt_params       = {}
+        if current_type == "bjt":
+            bjt_store  = {}
+            bjt_params = {}
+        else:
+            data_store       = []
+            identified_diode = None
     running = True
     return jsonify({"status": "running", "type": current_type})
 
@@ -512,7 +514,8 @@ def export_pdf():
         from reportlab.lib.pagesizes import A4
         from reportlab.lib import colors
         from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
-                                        Paragraph, Spacer, Image, HRFlowable)
+                                        Paragraph, Spacer, Image, HRFlowable,
+                                        PageBreak)
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import cm
         from reportlab.lib.enums import TA_CENTER
@@ -559,6 +562,51 @@ def export_pdf():
         ]))
         return t
 
+    # ── Table de mesures brutes (multi-colonnes, style dashboard) ──
+    def measurements_table(rows, headers, col_w, n_cols=1):
+        """
+        rows : liste de tuples (val1, val2, ...)
+        Répartit les lignes sur n_cols colonnes côte à côte pour
+        gagner de la place (utile quand il y a beaucoup de points).
+        """
+        if not rows:
+            return None
+        per_col = math.ceil(len(rows) / n_cols)
+        chunks = [rows[i*per_col:(i+1)*per_col] for i in range(n_cols)]
+
+        header_style = TableStyle([
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0,0), (-1,-1), 8),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#0a2342')),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.HexColor('#eef4fb'), colors.white]),
+            ('GRID', (0,0), (-1,-1), 0.4, colors.HexColor('#b0c8e0')),
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('TOPPADDING', (0,0), (-1,-1), 3),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ])
+
+        sub_tables = []
+        for chunk in chunks:
+            if not chunk:
+                continue
+            data = [headers] + [list(r) for r in chunk]
+            t = Table(data, colWidths=col_w)
+            t.setStyle(header_style)
+            sub_tables.append(t)
+
+        if len(sub_tables) <= 1:
+            return sub_tables[0] if sub_tables else None
+
+        # Placer les sous-tables côte à côte dans un tableau conteneur
+        outer = Table([sub_tables], colWidths=[doc.width/len(sub_tables)]*len(sub_tables))
+        outer.setStyle(TableStyle([
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('LEFTPADDING', (0,0), (-1,-1), 3),
+            ('RIGHTPADDING', (0,0), (-1,-1), 3),
+        ]))
+        return outer
+
     if mode == "bjt":
         elements += [T("SMART DIODE DASHBOARD", s_title),
                      T("Rapport Transistor 2N2222 — Famille de courbes Ic = f(Vce)", s_sub),
@@ -597,6 +645,24 @@ def export_pdf():
             plt.savefig(img_buf, format='png', dpi=150, bbox_inches='tight')
             plt.close(); img_buf.seek(0)
             elements += [Image(img_buf, width=15*cm, height=9*cm), Spacer(1, 0.4*cm)]
+
+        # ── Tableau de mesures brutes BJT (une sous-table par courbe IB) ──
+        if bjt_store:
+            elements.append(PageBreak())
+            elements.append(T("Tableau des mesures — toutes les courbes", s_section))
+            for lbl, pts in bjt_store.items():
+                if not pts:
+                    continue
+                pts_s = sorted(pts, key=lambda p: p["Vce"])
+                elements.append(T(f"Courbe {lbl}  ({len(pts_s)} points)",
+                                   ParagraphStyle('sub', fontSize=9.5,
+                                                  textColor=colors.HexColor('#1e6ab0'),
+                                                  fontName='Helvetica-Bold', spaceBefore=6, spaceAfter=3)))
+                rows = [(str(i+1), f"{p['Vce']:.3f}", f"{p['Ic']:.3f}") for i, p in enumerate(pts_s)]
+                tbl = measurements_table(rows, ["#", "Vce (V)", "Ic (mA)"],
+                                          [1.5*cm, 2.5*cm, 2.5*cm], n_cols=3)
+                if tbl:
+                    elements += [tbl, Spacer(1, 0.3*cm)]
     else:
         elements += [T("SMART DIODE DASHBOARD", s_title),
                      T("Rapport de Mesures Expérimentales — Diode/LED", s_sub),
@@ -643,7 +709,18 @@ def export_pdf():
             plt.close(); img_buf.seek(0)
             elements += [Image(img_buf, width=15*cm, height=8*cm), Spacer(1, 0.4*cm)]
 
-    elements += [HR(), T("Smart Diode Dashboard — ESP32 + MCP4725 — Rapport automatique", s_foot)]
+        # ── Tableau de mesures brutes diode (3 colonnes côte à côte) ──
+        if data_store:
+            elements.append(PageBreak())
+            elements.append(T(f"Tableau des mesures ({len(data_store)} points)", s_section))
+            rows = [(str(i+1), f"{d['U']:.3f}", f"{d['I']:.3f}") for i, d in enumerate(data_store)]
+            tbl = measurements_table(rows, ["#", "U (V)", "I (mA)"],
+                                      [1.5*cm, 2.5*cm, 2.5*cm], n_cols=3)
+            if tbl:
+                elements.append(tbl)
+
+    elements += [Spacer(1, 0.3*cm), HR(),
+                 T("Smart Diode Dashboard — ESP32 + MCP4725 — Rapport automatique", s_foot)]
     doc.build(elements)
     buffer.seek(0)
     fname = "rapport_transistor.pdf" if mode == "bjt" else "rapport_diode.pdf"
