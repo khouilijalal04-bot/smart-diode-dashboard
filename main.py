@@ -8,11 +8,13 @@ app = Flask(__name__)
 # ═══════════════════════════════════════════════
 data_store       = []          # diode: [{U, I}]
 bjt_store        = {}          # transistor: { "IB1": [{Vce, Ic}], "IB2": [...] }
+pv_store         = []          # PV: [{V, I}]
 running          = False
-current_type     = "diode"     # "diode" ou "bjt"
+current_type     = "diode"     # "diode" | "bjt" | "pv"
 current_ib_label = "IB1"
 identified_diode = None
 bjt_params       = {}          # β, Vbe, saturation, etc.
+pv_params        = {}          # Isc, Voc, Pmax, Vmpp, Impp, FF
 
 # ═══════════════════════════════════════════════
 #  BASE DE DONNÉES DES DIODES
@@ -384,6 +386,63 @@ def analyze_bjt(bjt_data):
     return result
 
 # ═══════════════════════════════════════════════
+#  ANALYSE CELLULE PHOTOVOLTAÏQUE
+# ═══════════════════════════════════════════════
+def analyze_pv(data):
+    """
+    Extrait Isc, Voc, Pmax, Vmpp, Impp, FF
+    depuis la courbe I = f(V) mesurée (0 -> Voc)
+    """
+    if len(data) < 4:
+        return {}
+
+    data_s = sorted(data, key=lambda d: d["V"])
+    v_vals = [d["V"] for d in data_s]
+    i_vals = [d["I"] for d in data_s]
+
+    # Isc : courant au point le plus proche de V=0 (extrapolation si 1er point > 0)
+    if v_vals[0] <= 0.005:
+        Isc = i_vals[0]
+    elif len(v_vals) >= 2 and (v_vals[1] - v_vals[0]) > 1e-9:
+        slope = (i_vals[1] - i_vals[0]) / (v_vals[1] - v_vals[0])
+        Isc = i_vals[0] - slope * v_vals[0]
+    else:
+        Isc = i_vals[0]
+    Isc = max(0.0, Isc)
+
+    # Voc : tension où I croise 0 (interpolation linéaire entre 2 points)
+    Voc = v_vals[-1]
+    found_voc = False
+    for k in range(len(i_vals) - 1):
+        if i_vals[k] > 0 and i_vals[k+1] <= 0:
+            dv = v_vals[k+1] - v_vals[k]
+            di = i_vals[k+1] - i_vals[k]
+            if abs(di) > 1e-9:
+                Voc = v_vals[k] + (0 - i_vals[k]) * dv / di
+            found_voc = True
+            break
+    if not found_voc:
+        Voc = v_vals[-1]
+
+    # Courbe de puissance P = V * I  (mW, avec V en V et I en mA)
+    p_vals = [round(v * i, 4) for v, i in zip(v_vals, i_vals)]
+    idx_max = max(range(len(p_vals)), key=lambda k: p_vals[k]) if p_vals else 0
+    Pmax = p_vals[idx_max] if p_vals else 0.0
+    Vmpp = v_vals[idx_max] if v_vals else 0.0
+    Impp = i_vals[idx_max] if i_vals else 0.0
+
+    FF = None
+    if Voc > 0 and Isc > 0:
+        FF = round((Pmax / (Voc * Isc)) * 100, 2)  # en %
+
+    return {
+        "v": v_vals, "i": i_vals, "p": p_vals,
+        "Isc": round(Isc, 4), "Voc": round(Voc, 4),
+        "Pmax": round(Pmax, 4), "Vmpp": round(Vmpp, 4), "Impp": round(Impp, 4),
+        "FF": FF, "n_points": len(v_vals),
+    }
+
+# ═══════════════════════════════════════════════
 #  ROUTES FLASK
 # ═══════════════════════════════════════════════
 @app.route("/")
@@ -400,7 +459,8 @@ def status():
 
 @app.route("/start", methods=["GET", "POST"])
 def start():
-    global running, data_store, bjt_store, identified_diode, bjt_params
+    global running, data_store, bjt_store, pv_store
+    global identified_diode, bjt_params, pv_params
     global current_type, current_ib_label
     body = request.get_json(silent=True) or {}
     current_type     = body.get("type", "diode")
@@ -410,6 +470,9 @@ def start():
         if current_type == "bjt":
             bjt_store  = {}
             bjt_params = {}
+        elif current_type == "pv":
+            pv_store  = []
+            pv_params = {}
         else:
             data_store       = []
             identified_diode = None
@@ -424,11 +487,14 @@ def stop():
 
 @app.route("/reset")
 def reset():
-    global data_store, bjt_store, identified_diode, bjt_params, running
+    global data_store, bjt_store, pv_store
+    global identified_diode, bjt_params, pv_params, running
     data_store       = []
     bjt_store        = {}
+    pv_store         = []
     identified_diode = None
     bjt_params       = {}
+    pv_params        = {}
     running          = False
     return jsonify({"status": "reset"})
 
@@ -442,7 +508,7 @@ def set_mode():
 
 @app.route("/data", methods=["POST"])
 def receive_data():
-    global data_store, bjt_store
+    global data_store, bjt_store, pv_store
     if not running:
         return jsonify({"status": "stopped"})
     d = request.json
@@ -455,6 +521,11 @@ def receive_data():
             if lbl not in bjt_store:
                 bjt_store[lbl] = []
             bjt_store[lbl].append({"Vce": round(vce, 4), "Ic": round(ic, 4)})
+    elif t == "pv":
+        V = float(d.get("voltage", 0))
+        I = float(d.get("current", 0))
+        if V >= 0 and I >= 0:
+            pv_store.append({"V": round(V, 4), "I": round(I, 4)})
     else:
         U = float(d.get("voltage", 0))
         I = float(d.get("current", 0))
@@ -469,6 +540,10 @@ def get_data():
 @app.route("/get_bjt")
 def get_bjt():
     return jsonify(bjt_store)
+
+@app.route("/get_pv")
+def get_pv():
+    return jsonify(pv_store)
 
 @app.route("/identify")
 def identify():
@@ -490,6 +565,15 @@ def analyze_bjt_route():
     bjt_params = result
     return jsonify(result)
 
+@app.route("/analyze_pv")
+def analyze_pv_route():
+    global pv_params
+    if len(pv_store) < 4:
+        return jsonify({"error": "not enough data"})
+    result = analyze_pv(pv_store)
+    pv_params = result
+    return jsonify(result)
+
 @app.route("/export_csv")
 def export_csv():
     mode = request.args.get("mode", "diode")
@@ -500,6 +584,13 @@ def export_csv():
                 lines.append(f"{lbl},{p['Vce']},{p['Ic']}\n")
         csv_data = "".join(lines)
         fname = "mesures_transistor.csv"
+    elif mode == "pv":
+        lines = ["V(V),I(mA),P(mW)\n"]
+        for d in sorted(pv_store, key=lambda d: d["V"]):
+            p = round(d["V"] * d["I"], 4)
+            lines.append(f"{d['V']},{d['I']},{p}\n")
+        csv_data = "".join(lines)
+        fname = "mesures_pv.csv"
     else:
         csv_data = "U(V),I(mA)\n" + "".join(f"{d['U']},{d['I']}\n" for d in data_store)
         fname = "mesures_diode.csv"
@@ -516,7 +607,7 @@ def export_pdf():
         from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
                                         Paragraph, Spacer, Image, HRFlowable,
                                         PageBreak)
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.styles import ParagraphStyle
         from reportlab.lib.units import cm
         from reportlab.lib.enums import TA_CENTER
         import matplotlib
@@ -531,17 +622,26 @@ def export_pdf():
                              rightMargin=2*cm, leftMargin=2*cm,
                              topMargin=2*cm, bottomMargin=2*cm)
     elements = []
+
+    # ── Couleurs claires et lisibles (thème dashboard, adapté impression) ──
+    C_TITLE   = colors.HexColor('#0a2342')   # navy — titres uniquement
+    C_HEADER  = colors.HexColor('#1e6ab0')   # bleu moyen — en-têtes de tableau (plus clair que navy)
+    C_ROWALT  = colors.HexColor('#eef4fb')   # bleu très pâle — lignes alternées
+    C_GRID    = colors.HexColor('#c3d6ea')   # gris-bleu clair — grille
+    C_PV      = colors.HexColor('#ff8f00')   # amber — accent PV
+
     T  = lambda txt, sty: Paragraph(txt, sty)
-    HR = lambda: HRFlowable(width="100%", thickness=0.8,
-                             color=colors.HexColor('#1e6ab0'), spaceAfter=10)
-    s_title   = ParagraphStyle('t', fontSize=20, textColor=colors.HexColor('#0a2342'),
+    HR = lambda: HRFlowable(width="100%", thickness=0.8, color=C_HEADER, spaceAfter=10)
+    s_title   = ParagraphStyle('t', fontSize=20, textColor=C_TITLE,
                                 fontName='Helvetica-Bold', alignment=TA_CENTER, spaceAfter=4)
-    s_sub     = ParagraphStyle('s', fontSize=10, textColor=colors.HexColor('#1e6ab0'),
+    s_sub     = ParagraphStyle('s', fontSize=10, textColor=C_HEADER,
                                 fontName='Helvetica', alignment=TA_CENTER, spaceAfter=2)
     s_date    = ParagraphStyle('d', fontSize=9, textColor=colors.grey,
                                 fontName='Helvetica', alignment=TA_CENTER, spaceAfter=12)
-    s_section = ParagraphStyle('sc', fontSize=12, textColor=colors.HexColor('#0a2342'),
+    s_section = ParagraphStyle('sc', fontSize=12, textColor=C_TITLE,
                                 fontName='Helvetica-Bold', spaceAfter=6, spaceBefore=10)
+    s_sub2    = ParagraphStyle('sub', fontSize=9.5, textColor=C_HEADER,
+                                fontName='Helvetica-Bold', spaceBefore=6, spaceAfter=3)
     s_foot    = ParagraphStyle('f', fontSize=8, textColor=colors.grey,
                                 fontName='Helvetica', alignment=TA_CENTER)
 
@@ -553,59 +653,35 @@ def export_pdf():
             ('FONTNAME', (0,0), (0,-1), 'Helvetica-Bold'),
             ('FONTNAME', (1,0), (1,-1), 'Helvetica'),
             ('FONTSIZE', (0,0), (-1,-1), 10),
-            ('TEXTCOLOR', (0,0), (0,-1), colors.HexColor('#0a2342')),
-            ('ROWBACKGROUNDS', (0,0), (-1,-1), [colors.HexColor('#eef4fb'), colors.white]),
-            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#b0c8e0')),
+            ('TEXTCOLOR', (0,0), (0,-1), C_TITLE),
+            ('ROWBACKGROUNDS', (0,0), (-1,-1), [C_ROWALT, colors.white]),
+            ('GRID', (0,0), (-1,-1), 0.5, C_GRID),
             ('TOPPADDING', (0,0), (-1,-1), 7),
             ('BOTTOMPADDING', (0,0), (-1,-1), 7),
             ('LEFTPADDING', (0,0), (-1,-1), 10),
         ]))
         return t
 
-    # ── Table de mesures brutes (multi-colonnes, style dashboard) ──
-    def measurements_table(rows, headers, col_w, n_cols=1):
-        """
-        rows : liste de tuples (val1, val2, ...)
-        Répartit les lignes sur n_cols colonnes côte à côte pour
-        gagner de la place (utile quand il y a beaucoup de points).
-        """
+    # ── Tableau de mesures — une ligne sous l'autre, pleine largeur,
+    #    header répété automatiquement sur chaque nouvelle page ──
+    def measurements_table(rows, headers, col_w):
         if not rows:
             return None
-        per_col = math.ceil(len(rows) / n_cols)
-        chunks = [rows[i*per_col:(i+1)*per_col] for i in range(n_cols)]
-
-        header_style = TableStyle([
+        data = [headers] + [list(r) for r in rows]
+        t = Table(data, colWidths=col_w, repeatRows=1)
+        t.setStyle(TableStyle([
             ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0,0), (-1,-1), 8),
+            ('FONTNAME', (0,1), (-1,-1), 'Helvetica'),
+            ('FONTSIZE', (0,0), (-1,-1), 9),
             ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#0a2342')),
-            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.HexColor('#eef4fb'), colors.white]),
-            ('GRID', (0,0), (-1,-1), 0.4, colors.HexColor('#b0c8e0')),
+            ('BACKGROUND', (0,0), (-1,0), C_HEADER),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [C_ROWALT, colors.white]),
+            ('GRID', (0,0), (-1,-1), 0.4, C_GRID),
             ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-            ('TOPPADDING', (0,0), (-1,-1), 3),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 3),
-        ])
-
-        sub_tables = []
-        for chunk in chunks:
-            if not chunk:
-                continue
-            data = [headers] + [list(r) for r in chunk]
-            t = Table(data, colWidths=col_w)
-            t.setStyle(header_style)
-            sub_tables.append(t)
-
-        if len(sub_tables) <= 1:
-            return sub_tables[0] if sub_tables else None
-
-        # Placer les sous-tables côte à côte dans un tableau conteneur
-        outer = Table([sub_tables], colWidths=[doc.width/len(sub_tables)]*len(sub_tables))
-        outer.setStyle(TableStyle([
-            ('VALIGN', (0,0), (-1,-1), 'TOP'),
-            ('LEFTPADDING', (0,0), (-1,-1), 3),
-            ('RIGHTPADDING', (0,0), (-1,-1), 3),
+            ('TOPPADDING', (0,0), (-1,-1), 4.5),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 4.5),
         ]))
-        return outer
+        return t
 
     if mode == "bjt":
         elements += [T("SMART DIODE DASHBOARD", s_title),
@@ -646,7 +722,6 @@ def export_pdf():
             plt.close(); img_buf.seek(0)
             elements += [Image(img_buf, width=15*cm, height=9*cm), Spacer(1, 0.4*cm)]
 
-        # ── Tableau de mesures brutes BJT (une sous-table par courbe IB) ──
         if bjt_store:
             elements.append(PageBreak())
             elements.append(T("Tableau des mesures — toutes les courbes", s_section))
@@ -654,15 +729,70 @@ def export_pdf():
                 if not pts:
                     continue
                 pts_s = sorted(pts, key=lambda p: p["Vce"])
-                elements.append(T(f"Courbe {lbl}  ({len(pts_s)} points)",
-                                   ParagraphStyle('sub', fontSize=9.5,
-                                                  textColor=colors.HexColor('#1e6ab0'),
-                                                  fontName='Helvetica-Bold', spaceBefore=6, spaceAfter=3)))
+                elements.append(T(f"Courbe {lbl}  ({len(pts_s)} points)", s_sub2))
                 rows = [(str(i+1), f"{p['Vce']:.3f}", f"{p['Ic']:.3f}") for i, p in enumerate(pts_s)]
-                tbl = measurements_table(rows, ["#", "Vce (V)", "Ic (mA)"],
-                                          [1.5*cm, 2.5*cm, 2.5*cm], n_cols=3)
+                tbl = measurements_table(rows, ["#", "Vce (V)", "Ic (mA)"], [2.5*cm, 7*cm, 7*cm])
                 if tbl:
-                    elements += [tbl, Spacer(1, 0.3*cm)]
+                    elements += [tbl, Spacer(1, 0.4*cm)]
+
+    elif mode == "pv":
+        elements += [T("SMART DIODE DASHBOARD", s_title),
+                     T("Rapport Cellule Photovoltaïque — Courbes I=f(V) et P=f(V)", s_sub),
+                     T(f"Généré le : {now}", s_date), HR()]
+        if pv_params:
+            elements.append(T("Paramètres extraits — Cellule PV", s_section))
+            pp = pv_params
+            rows = [
+                ["Isc — courant de court-circuit", f"{pp.get('Isc', 0):.3f} mA"],
+                ["Voc — tension à circuit ouvert", f"{pp.get('Voc', 0):.3f} V"],
+                ["Pmax — puissance maximale (MPP)", f"{pp.get('Pmax', 0):.3f} mW"],
+                ["Vmpp — tension au point de puissance max", f"{pp.get('Vmpp', 0):.3f} V"],
+                ["Impp — courant au point de puissance max", f"{pp.get('Impp', 0):.3f} mA"],
+                ["FF — facteur de forme", f"{pp['FF']:.1f} %" if pp.get('FF') is not None else "—"],
+            ]
+            elements += [styled_table(rows, [7.5*cm, 8.5*cm]), Spacer(1, 0.4*cm)]
+        if pv_store:
+            elements.append(T("Courbes I = f(V) et P = f(V)", s_section))
+            pv_sorted = sorted(pv_store, key=lambda d: d["V"])
+            v_s = [d["V"] for d in pv_sorted]
+            i_s = [d["I"] for d in pv_sorted]
+            p_s = [round(v*i, 4) for v, i in zip(v_s, i_s)]
+            fig, ax1 = plt.subplots(figsize=(7.5, 4.5))
+            ax2 = ax1.twinx()
+            ax1.plot(v_s, i_s, color='#1e6ab0', linewidth=2.2, marker='o',
+                     markersize=2.5, label='I (mA)')
+            ax2.plot(v_s, p_s, color='#ff8f00', linewidth=2.2, linestyle='--',
+                     marker='s', markersize=2, label='P (mW)')
+            if pv_params and pv_params.get('Vmpp') is not None:
+                ax1.axvline(x=pv_params['Vmpp'], color='#3ddc84', linestyle=':',
+                            linewidth=1.4, alpha=0.85, label='MPP')
+            ax1.set_xlabel("V (V)", fontsize=10)
+            ax1.set_ylabel("I (mA)", fontsize=10, color='#1e6ab0')
+            ax2.set_ylabel("P (mW)", fontsize=10, color='#ff8f00')
+            ax1.set_title("Cellule PV — I = f(V) et P = f(V)", fontsize=11,
+                           color='#0a2342', fontweight='bold')
+            ax1.grid(True, color='#e0e8f0', linewidth=0.5)
+            l1, lb1 = ax1.get_legend_handles_labels()
+            l2, lb2 = ax2.get_legend_handles_labels()
+            ax1.legend(l1 + l2, lb1 + lb2, fontsize=8, loc='upper right')
+            ax1.set_facecolor('#f8fbff'); fig.patch.set_facecolor('white')
+            plt.tight_layout()
+            img_buf = io.BytesIO()
+            plt.savefig(img_buf, format='png', dpi=150, bbox_inches='tight')
+            plt.close(); img_buf.seek(0)
+            elements += [Image(img_buf, width=15*cm, height=9*cm), Spacer(1, 0.4*cm)]
+
+        if pv_store:
+            elements.append(PageBreak())
+            pv_sorted = sorted(pv_store, key=lambda d: d["V"])
+            elements.append(T(f"Tableau des mesures ({len(pv_sorted)} points)", s_section))
+            rows = [(str(i+1), f"{d['V']:.3f}", f"{d['I']:.3f}", f"{d['V']*d['I']:.3f}")
+                    for i, d in enumerate(pv_sorted)]
+            tbl = measurements_table(rows, ["#", "V (V)", "I (mA)", "P (mW)"],
+                                      [2.2*cm, 4.6*cm, 4.6*cm, 4.6*cm])
+            if tbl:
+                elements.append(tbl)
+
     else:
         elements += [T("SMART DIODE DASHBOARD", s_title),
                      T("Rapport de Mesures Expérimentales — Diode/LED", s_sub),
@@ -709,13 +839,11 @@ def export_pdf():
             plt.close(); img_buf.seek(0)
             elements += [Image(img_buf, width=15*cm, height=8*cm), Spacer(1, 0.4*cm)]
 
-        # ── Tableau de mesures brutes diode (3 colonnes côte à côte) ──
         if data_store:
             elements.append(PageBreak())
             elements.append(T(f"Tableau des mesures ({len(data_store)} points)", s_section))
             rows = [(str(i+1), f"{d['U']:.3f}", f"{d['I']:.3f}") for i, d in enumerate(data_store)]
-            tbl = measurements_table(rows, ["#", "U (V)", "I (mA)"],
-                                      [1.5*cm, 2.5*cm, 2.5*cm], n_cols=3)
+            tbl = measurements_table(rows, ["#", "U (V)", "I (mA)"], [2.5*cm, 7*cm, 7*cm])
             if tbl:
                 elements.append(tbl)
 
@@ -723,7 +851,7 @@ def export_pdf():
                  T("Smart Diode Dashboard — ESP32 + MCP4725 — Rapport automatique", s_foot)]
     doc.build(elements)
     buffer.seek(0)
-    fname = "rapport_transistor.pdf" if mode == "bjt" else "rapport_diode.pdf"
+    fname = {"bjt": "rapport_transistor.pdf", "pv": "rapport_pv.pdf"}.get(mode, "rapport_diode.pdf")
     return buffer.read(), 200, {
         "Content-Type": "application/pdf",
         "Content-Disposition": f"attachment; filename={fname}"
@@ -778,13 +906,14 @@ html,body{height:100%;background:var(--bg);font-family:var(--sans);color:var(--t
 .logo-sub{font-size:9px;color:var(--muted);margin-top:1px}
 .mode-tabs{display:flex;gap:2px;background:var(--surface2);border-radius:var(--r-sm);
   padding:3px;border:1px solid var(--border)}
-.mode-tab{padding:5px 18px;border-radius:var(--r-xs);font-size:12px;font-weight:500;
+.mode-tab{padding:5px 16px;border-radius:var(--r-xs);font-size:12px;font-weight:500;
   cursor:pointer;transition:all .2s;color:var(--muted);display:flex;align-items:center;gap:6px;
   border:none;background:transparent}
 .mode-tab i{font-size:14px}
 .mode-tab:hover{color:var(--text);background:var(--surface3)}
 .mode-tab.active{background:var(--blue-dk);color:#fff;box-shadow:0 2px 8px rgba(74,158,255,.25)}
 .mode-tab.active.bjt{background:linear-gradient(135deg,#8B2FC9,#5B2FC9)}
+.mode-tab.active.pv{background:linear-gradient(135deg,#ffb347,#ff8f00)}
 .hdr-right{display:flex;align-items:center;gap:16px;margin-left:auto}
 .hdr-stat{text-align:right}
 .hdr-val{font-family:var(--mono);font-size:14px;font-weight:600}
@@ -845,6 +974,8 @@ select option{background:var(--surface2)}
 .btn-id:hover:not(:disabled){background:rgba(74,158,255,.2);border-color:var(--blue)}
 .btn-bjt{background:var(--purple-lt);color:var(--purple);border-color:rgba(167,139,250,.3);padding:9px 12px;font-size:12px}
 .btn-bjt:hover:not(:disabled){background:rgba(167,139,250,.2);border-color:var(--purple)}
+.btn-pv{background:var(--amber-lt);color:var(--amber);border-color:rgba(255,179,71,.3);padding:9px 12px;font-size:12px}
+.btn-pv:hover:not(:disabled){background:rgba(255,179,71,.2);border-color:var(--amber)}
 
 /* ── IB SELECTOR ── */
 .ib-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-top:6px}
@@ -888,7 +1019,7 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
   cursor:pointer;display:flex;align-items:center;gap:3px;transition:all .15s;font-family:var(--sans)}
 .curve-btn:hover{color:var(--text);border-color:var(--blue)}
 
-/* ── BJT PARAMS DISPLAY ── */
+/* ── BJT / PV PARAMS DISPLAY ── */
 .bjt-params-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:8px}
 .bjt-param{background:var(--surface2);border:1px solid var(--border);
   border-radius:var(--r-sm);padding:7px;text-align:center}
@@ -963,10 +1094,12 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
 .export-row .btn{flex:1;font-size:10px;padding:6px}
 .divider{height:1px;background:var(--border);margin:6px 0}
 
-/* ── VIEW TOGGLE (diode/bjt) ── */
-.view-diode .bjt-only{display:none}
-.view-bjt .diode-only{display:none}
+/* ── VIEW TOGGLE (diode/bjt/pv) ── */
+.view-diode .bjt-only,.view-diode .pv-only{display:none}
+.view-bjt .diode-only,.view-bjt .pv-only{display:none}
+.view-pv .diode-only,.view-pv .bjt-only{display:none}
 .view-bjt .panel-hd i.panel-icon{color:var(--purple)}
+.view-pv .panel-hd i.panel-icon{color:var(--amber)}
 
 /* ── TOAST ── */
 .toast{position:fixed;bottom:16px;right:16px;z-index:999;
@@ -984,6 +1117,7 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
   border-radius:20px;font-size:9px;font-weight:600;font-family:var(--mono)}
 .chip-blue{background:var(--blue-lt);color:var(--blue);border:1px solid rgba(74,158,255,.3)}
 .chip-purple{background:var(--purple-lt);color:var(--purple);border:1px solid rgba(167,139,250,.3)}
+.chip-amber{background:var(--amber-lt);color:var(--amber);border:1px solid rgba(255,179,71,.3)}
 </style>
 </head>
 <body>
@@ -994,7 +1128,7 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
     <div class="logo-icon">⚡</div>
     <div>
       <div class="logo-name">Smart Component Lab</div>
-      <div class="logo-sub">ESP32 · MCP4725 · 2N2222</div>
+      <div class="logo-sub">ESP32 · MCP4725 · 2N2222 · PV 5V</div>
     </div>
   </div>
 
@@ -1004,6 +1138,9 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
     </button>
     <button class="mode-tab" id="tab-bjt" onclick="switchMode('bjt')">
       <i class="ti ti-cpu"></i> Transistor 2N2222
+    </button>
+    <button class="mode-tab" id="tab-pv" onclick="switchMode('pv')">
+      <i class="ti ti-sun"></i> Cellule PV
     </button>
   </div>
 
@@ -1077,6 +1214,24 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
       </div>
     </div>
 
+    <!-- Contrôle PV -->
+    <div class="panel pv-only" id="ctrl-pv">
+      <div class="panel-hd">
+        <i class="ti ti-sun panel-icon"></i>
+        <span class="panel-title">Cellule PV 5V</span>
+      </div>
+      <label>V max sweep (V)</label>
+      <input type="number" id="vmax-pv" value="5" step="0.1" min="0.5" max="6">
+      <label>Pas (V)</label>
+      <input type="number" id="vstep-pv" value="0.05" step="0.01" min="0.01">
+      <div style="margin-top:10px">
+        <button class="btn btn-start" onclick="startPv()"><i class="ti ti-player-play"></i> Start sweep</button>
+        <button class="btn btn-stop"  onclick="stopSweep()"><i class="ti ti-player-stop"></i> Stop</button>
+        <button class="btn btn-pv"    onclick="analyzePv()"><i class="ti ti-bolt"></i> Analyser MPP</button>
+        <button class="btn"           onclick="resetAll()"><i class="ti ti-refresh"></i> Reset tout</button>
+      </div>
+    </div>
+
     <!-- Live -->
     <div class="panel">
       <div class="panel-hd">
@@ -1127,6 +1282,7 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
           <button class="curve-btn diode-only" onclick="clearMeasured()"><i class="ti ti-eraser"></i> Mesure</button>
           <button class="curve-btn diode-only" onclick="clearTheory()"><i class="ti ti-line-dashed"></i> Théo.</button>
           <button class="curve-btn bjt-only"   onclick="clearBjt()"><i class="ti ti-eraser"></i> Tout effacer</button>
+          <button class="curve-btn pv-only"    onclick="clearMeasured()"><i class="ti ti-eraser"></i> Effacer</button>
         </div>
         <span style="font-size:8px;color:var(--hint);margin-left:5px">Scroll=zoom · Drag=pan</span>
       </div>
@@ -1216,6 +1372,40 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
         </div>
       </div>
     </div>
+
+    <!-- PV params (pv only) -->
+    <div class="panel pv-only" id="pv-params-panel">
+      <div class="panel-hd">
+        <i class="ti ti-sun panel-icon"></i>
+        <span class="panel-title">Paramètres Cellule PV</span>
+      </div>
+      <div class="bjt-params-grid">
+        <div class="bjt-param">
+          <div class="bjt-param-val" id="pv-isc" style="color:var(--blue)">—</div>
+          <div class="bjt-param-lbl">Isc (mA)</div>
+        </div>
+        <div class="bjt-param">
+          <div class="bjt-param-val" id="pv-voc" style="color:var(--cyan)">—</div>
+          <div class="bjt-param-lbl">Voc (V)</div>
+        </div>
+        <div class="bjt-param">
+          <div class="bjt-param-val" id="pv-pmax" style="color:var(--amber)">—</div>
+          <div class="bjt-param-lbl">Pmax (mW)</div>
+        </div>
+        <div class="bjt-param">
+          <div class="bjt-param-val" id="pv-vmpp" style="color:var(--blue)">—</div>
+          <div class="bjt-param-lbl">Vmpp (V)</div>
+        </div>
+        <div class="bjt-param">
+          <div class="bjt-param-val" id="pv-impp" style="color:var(--cyan)">—</div>
+          <div class="bjt-param-lbl">Impp (mA)</div>
+        </div>
+        <div class="bjt-param">
+          <div class="bjt-param-val" id="pv-ff" style="color:var(--amber)">—</div>
+          <div class="bjt-param-lbl">FF (%)</div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- ══ COLONNE DROITE ══ -->
@@ -1295,6 +1485,33 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
       </div>
     </div>
 
+    <!-- PV Info (pv only) -->
+    <div class="panel pv-only">
+      <div class="panel-hd">
+        <i class="ti ti-info-circle panel-icon"></i>
+        <span class="panel-title">Guide Cellule PV</span>
+      </div>
+      <div style="font-size:10px;color:var(--muted);line-height:1.7">
+        <div style="margin-bottom:6px">
+          <span class="chip chip-amber">PV 5V</span>
+          <span style="margin-left:6px;font-size:9px">Cellule photovoltaïque</span>
+        </div>
+        <div class="divider"></div>
+        <div><b style="color:var(--text)">Isc</b> = courant à V=0 (court-circuit)</div>
+        <div><b style="color:var(--text)">Voc</b> = tension à I=0 (circuit ouvert)</div>
+        <div><b style="color:var(--text)">MPP</b> = Vmpp × Impp = puissance max</div>
+        <div><b style="color:var(--text)">FF</b> = Pmax / (Voc × Isc)</div>
+        <div class="divider"></div>
+        <div style="font-size:9px;margin-top:2px">
+          <b style="color:var(--amber)">Procédure de mesure :</b><br>
+          1. Cliquer "Start sweep"<br>
+          2. Attendre la fin du balayage V (0 → Voc)<br>
+          3. Cliquer "Analyser MPP"<br>
+          4. Lire Isc, Voc, Pmax, Vmpp, Impp, FF
+        </div>
+      </div>
+    </div>
+
     <!-- Export -->
     <div class="panel">
       <div class="panel-hd">
@@ -1314,10 +1531,12 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
 <script>
 // ── State ──────────────────────────────────────
 let chart, currentRes = null, isRunning = false;
-let activeMode = 'diode';   // 'diode' | 'bjt'
+let activeMode = 'diode';   // 'diode' | 'bjt' | 'pv'
 let activeIb   = 'IB1';
 let bjtData    = {};        // { IB1: [{x,y}], IB2: [...] }
 let bjtParams  = null;
+let pvData     = [];        // [{x:V, y:I}]
+let pvParams   = null;
 
 const IB_COLORS = {
   IB1:'#4a9eff', IB2:'#ff6b6b', IB3:'#3ddc84',
@@ -1341,6 +1560,7 @@ function switchMode(mode) {
 
   document.getElementById('tab-diode').className = 'mode-tab' + (mode === 'diode' ? ' active' : '');
   document.getElementById('tab-bjt').className   = 'mode-tab' + (mode === 'bjt'   ? ' active bjt' : '');
+  document.getElementById('tab-pv').className    = 'mode-tab' + (mode === 'pv'    ? ' active pv'  : '');
 
   const title = document.getElementById('chart-title');
   if (mode === 'bjt') {
@@ -1353,6 +1573,16 @@ function switchMode(mode) {
     document.getElementById('li-lbl').textContent  = 'mA (Ic)';
     applyAxes();
     rebuildBjtChart();
+  } else if (mode === 'pv') {
+    title.textContent = 'I = f(V) & P = f(V) — Cellule PV';
+    document.getElementById('xmax').value = '5';
+    document.getElementById('ymax').value = '60';
+    document.getElementById('col1-hd').textContent = 'V (V)';
+    document.getElementById('col2-hd').textContent = 'I (mA)';
+    document.getElementById('lv-lbl').textContent  = 'Volts (V)';
+    document.getElementById('li-lbl').textContent  = 'mA (I)';
+    applyAxes();
+    rebuildPvChart();
   } else {
     title.textContent = 'Courbe I = f(U)';
     document.getElementById('xmax').value = '3.3';
@@ -1362,6 +1592,7 @@ function switchMode(mode) {
     document.getElementById('lv-lbl').textContent  = 'Volts (U)';
     document.getElementById('li-lbl').textContent  = 'mA (I)';
     applyAxes();
+    rebuildDiodeChart();
   }
 }
 
@@ -1409,12 +1640,15 @@ function initChart(){
           callbacks:{
             title: i => {
               const x = Number(i[0].parsed.x).toFixed(3);
-              return activeMode === 'bjt' ? 'Vce = ' + x + ' V' : 'U = ' + x + ' V';
+              if(activeMode === 'bjt') return 'Vce = ' + x + ' V';
+              if(activeMode === 'pv')  return 'V = ' + x + ' V';
+              return 'U = ' + x + ' V';
             },
             label: i => {
               const y = Number(i[0].parsed.y).toFixed(4);
-              const prefix = activeMode === 'bjt' ? 'Ic' : 'I';
-              return (i[0].dataset.ibLabel || i[0].dataset.label || prefix) + ': ' + y + ' mA';
+              const prefix = activeMode === 'bjt' ? 'Ic' : (activeMode === 'pv' ? '' : 'I');
+              return (i[0].dataset.ibLabel || i[0].dataset.label || prefix) + ': ' + y +
+                (i[0].dataset.yAxisID === 'y1' ? ' mW' : ' mA');
             }
           }
         },
@@ -1441,8 +1675,7 @@ function initChart(){
 
 // ── Rebuild BJT chart (multi-courbes) ─────────
 function rebuildBjtChart(){
-  // Garder 3 datasets fixes (diode) + ajouter dynamiquement les courbes BJT
-  // Pour BJT on remplace tout
+  delete chart.options.scales.y1;
   const labels = Object.keys(IB_COLORS);
   const datasets = [];
 
@@ -1471,6 +1704,7 @@ function rebuildBjtChart(){
 
 // ── Rebuild Diode chart ───────────────────────
 function rebuildDiodeChart(){
+  delete chart.options.scales.y1;
   chart.data.datasets = [
     { label:'Mesure', data:[], order:1,
       borderColor:'#4a9eff', backgroundColor:'rgba(74,158,255,0.07)',
@@ -1486,6 +1720,30 @@ function rebuildDiodeChart(){
   ];
   chart.options.scales.x.title.text = 'U (V)';
   chart.options.scales.y.title.text = 'I (mA)';
+  chart.update('none');
+}
+
+// ── Rebuild PV chart (I sur y, P sur y1 secondaire) ─────
+function rebuildPvChart(){
+  const pts  = pvData;
+  const pPts = pts.map(p => ({x:p.x, y:+(p.x*p.y).toFixed(4)}));
+  chart.data.datasets = [
+    { label:'I (mA)', data: pts, yAxisID:'y', order:1,
+      borderColor:'#4a9eff', backgroundColor:'rgba(74,158,255,0.07)',
+      pointRadius: pts.length < 80 ? 2 : 0, borderWidth:2, tension:.3, fill:true },
+    { label:'P (mW)', data: pPts, yAxisID:'y1', order:2,
+      borderColor:'#ffb347', backgroundColor:'transparent',
+      pointRadius: pPts.length < 80 ? 2 : 0, borderWidth:2, tension:.3,
+      showLine:true, segment:{borderDash:[5,3]} }
+  ];
+  chart.options.scales.x.title.text = 'V (V)';
+  chart.options.scales.y.title.text = 'I (mA)';
+  chart.options.scales.y1 = {
+    position:'right', min:0,
+    title:{display:true, text:'P (mW)', color:'#ffb347', font:{size:10}},
+    ticks:{color:'#ffb347', font:{size:9}},
+    grid:{drawOnChartArea:false}
+  };
   chart.update('none');
 }
 
@@ -1558,6 +1816,8 @@ function autoScale(){
     Object.values(bjtData).forEach(pts => {
       pts.forEach(p => { allX.push(p.x); allY.push(p.y); });
     });
+  } else if (activeMode === 'pv') {
+    pvData.forEach(p => { allX.push(p.x); allY.push(p.y); });
   } else {
     const d = chart.data.datasets[0].data;
     d.forEach(p => { allX.push(p.x); allY.push(p.y); });
@@ -1604,9 +1864,24 @@ function startBjt(){
   }).catch(()=>{}).finally(()=>{
     isRunning = true; setStatus('live');
     toast('Mesure ' + activeIb + ' (' + IB_UA[activeIb] + ' µA) démarrée', 'ok');
-    // marquer le bouton comme "en cours"
     const btn = document.getElementById('ibBtn-' + activeIb);
     if(btn) btn.style.borderColor = 'var(--blue)';
+  });
+}
+
+function startPv(){
+  fetch('/start', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({type:'pv', reset:true})
+  }).catch(()=>{}).finally(()=>{
+    isRunning = true; setStatus('live');
+    pvData = [];
+    rebuildPvChart();
+    document.getElementById('tbody').innerHTML = '';
+    document.getElementById('pts-lbl').textContent = '0 pts';
+    ['pv-isc','pv-voc','pv-pmax','pv-vmpp','pv-impp','pv-ff'].forEach(id =>
+      document.getElementById(id).textContent = '—');
+    toast('Sweep PV démarré', 'ok');
   });
 }
 
@@ -1622,6 +1897,7 @@ function resetAll(){
   fetch('/reset').catch(()=>{}).finally(()=>{
     isRunning = false; setStatus('idle');
     bjtData = {}; bjtParams = null;
+    pvData = []; pvParams = null;
     rebuildDiodeChart();
     currentRes = null;
     document.getElementById('tbody').innerHTML = '';
@@ -1633,21 +1909,22 @@ function resetAll(){
     document.getElementById('pts-lbl').textContent = '0 pts';
     document.getElementById('id-result').style.display = 'none';
     document.getElementById('id-hint').textContent = 'Minimum 6 points requis';
-    // reset ib buttons
     document.querySelectorAll('.ib-btn').forEach(b => { b.className = 'ib-btn'; b.style.borderColor = ''; });
     document.getElementById('ibBtn-IB1').classList.add('active');
-    // reset bjt params
     ['b-beta','b-icmax','b-vsat','beta-big'].forEach(id => document.getElementById(id).textContent = '—');
     document.getElementById('beta-row').style.display = 'none';
     document.getElementById('ib-legend').innerHTML = '';
+    ['pv-isc','pv-voc','pv-pmax','pv-vmpp','pv-impp','pv-ff'].forEach(id =>
+      document.getElementById(id).textContent = '—');
     if(activeMode === 'bjt') rebuildBjtChart();
+    else if(activeMode === 'pv') rebuildPvChart();
     toast('Tout réinitialisé', 'info');
   });
 }
 
 // ── Analyze BJT ───────────────────────────────
 function analyzeBjt(){
-  const btn = document.querySelector('.btn-bjt');
+  const btn = document.querySelector('#ctrl-bjt .btn-bjt');
   if(btn){ btn.disabled = true; btn.innerHTML = '<i class="ti ti-loader-2"></i> Analyse...'; }
   fetch('/analyze_bjt').then(r => r.json()).then(res => {
     if(btn){ btn.disabled = false; btn.innerHTML = '<i class="ti ti-math-function"></i> Analyser β / zones'; }
@@ -1668,9 +1945,34 @@ function analyzeBjt(){
   });
 }
 
+// ── Analyze PV ────────────────────────────────
+function analyzePv(){
+  const btn = document.querySelector('#ctrl-pv .btn-pv');
+  if(btn){ btn.disabled = true; btn.innerHTML = '<i class="ti ti-loader-2"></i> Analyse...'; }
+  fetch('/analyze_pv').then(r => r.json()).then(res => {
+    if(btn){ btn.disabled = false; btn.innerHTML = '<i class="ti ti-bolt"></i> Analyser MPP'; }
+    if(res.error){ toast('⚠ ' + res.error, 'err'); return; }
+    pvParams = res;
+    document.getElementById('pv-isc').textContent  = res.Isc.toFixed(2);
+    document.getElementById('pv-voc').textContent  = res.Voc.toFixed(3);
+    document.getElementById('pv-pmax').textContent = res.Pmax.toFixed(2);
+    document.getElementById('pv-vmpp').textContent = res.Vmpp.toFixed(3);
+    document.getElementById('pv-impp').textContent = res.Impp.toFixed(2);
+    document.getElementById('pv-ff').textContent   = res.FF !== null ? res.FF.toFixed(1) : '—';
+    toast('MPP = ' + res.Pmax.toFixed(2) + ' mW @ Vmpp=' + res.Vmpp.toFixed(2) + 'V', 'ok', 3500);
+  }).catch(() => {
+    if(btn){ btn.disabled = false; btn.innerHTML = '<i class="ti ti-bolt"></i> Analyser MPP'; }
+    toast('Erreur analyse PV', 'err');
+  });
+}
+
 // ── Clear ─────────────────────────────────────
 function clearMeasured(){
-  chart.data.datasets[0].data = []; chart.update('none');
+  if(activeMode === 'pv'){
+    pvData = []; rebuildPvChart();
+  } else {
+    chart.data.datasets[0].data = []; chart.update('none');
+  }
   toast('Courbe mesure effacée', 'info');
 }
 function clearTheory(){
@@ -1770,8 +2072,6 @@ function exportCSV(){ window.location.href = '/export_csv?mode=' + activeMode; }
 function exportPDF(){ window.location.href = '/export_pdf?mode=' + activeMode; }
 
 // ── Polling ───────────────────────────────────
-let lastPts = 0;
-
 function updateLive(){
   if(activeMode === 'diode'){
     fetch('/get_data').then(r => r.json()).then(data => {
@@ -1794,6 +2094,27 @@ function updateLive(){
         document.getElementById('hi').innerHTML  = I + '<span style="font-size:9px;color:var(--muted)"> mA</span>';
       }
     }).catch(()=>{});
+  } else if(activeMode === 'pv'){
+    fetch('/get_pv').then(r => r.json()).then(data => {
+      if(activeMode !== 'pv') return;
+      pvData = data.map(d => ({x:+d.V, y:+d.I}));
+      rebuildPvChart();
+      const n = data.length;
+      document.getElementById('pts-lbl').textContent = n + ' pts';
+      document.getElementById('hpts').innerHTML = n + '<span style="font-size:9px;color:var(--muted)"> pts</span>';
+      const sl = data.slice(-60);
+      document.getElementById('tbody').innerHTML = sl.map((d,i) =>
+        `<tr><td>${data.length-sl.length+i+1}</td><td>${(+d.V).toFixed(3)}</td><td>${(+d.I).toFixed(3)}</td></tr>`
+      ).join('');
+      if(n > 0){
+        const last = data[n-1];
+        const V = (+last.V).toFixed(3), I = (+last.I).toFixed(3);
+        document.getElementById('lv').textContent = V;
+        document.getElementById('li').textContent = I;
+        document.getElementById('hv').innerHTML  = V + '<span style="font-size:9px;color:var(--muted)"> V</span>';
+        document.getElementById('hi').innerHTML  = I + '<span style="font-size:9px;color:var(--muted)"> mA</span>';
+      }
+    }).catch(()=>{});
   } else {
     // Mode BJT : polling get_bjt
     fetch('/get_bjt').then(r => r.json()).then(data => {
@@ -1808,10 +2129,8 @@ function updateLive(){
       });
       if(changed){
         rebuildBjtChart();
-        // Update header
         document.getElementById('pts-lbl').textContent = totalPts + ' pts';
         document.getElementById('hpts').innerHTML = totalPts + '<span style="font-size:9px;color:var(--muted)"> pts</span>';
-        // Marquer boutons IB "done"
         Object.keys(data).forEach(lbl => {
           const btn = document.getElementById('ibBtn-' + lbl);
           if(btn && data[lbl].length > 0 && lbl !== activeIb){
@@ -1820,7 +2139,6 @@ function updateLive(){
             btn.style.borderColor = '';
           }
         });
-        // Live val = last point du IB actif
         const activePts = bjtData[activeIb] || [];
         if(activePts.length > 0){
           const last = activePts[activePts.length-1];
@@ -1829,7 +2147,6 @@ function updateLive(){
           document.getElementById('hv').innerHTML  = last.x.toFixed(3) + '<span style="font-size:9px;color:var(--muted)"> V</span>';
           document.getElementById('hi').innerHTML  = last.y.toFixed(3) + '<span style="font-size:9px;color:var(--muted)"> mA</span>';
         }
-        // Table : afficher dernière courbe active
         const sl = activePts.slice(-60);
         document.getElementById('tbody').innerHTML = sl.map((p,i) =>
           `<tr><td>${activePts.length-sl.length+i+1}</td><td>${p.x.toFixed(3)}</td><td>${p.y.toFixed(3)}</td></tr>`
